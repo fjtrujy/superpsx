@@ -129,6 +129,8 @@ static uint32_t run_iterations = 0;
 static uint32_t idle_skip_pc = 0;
 static uint32_t idle_skip_count = 0;
 static uint32_t poll_detect_pc = 0;
+static uint32_t *poll_patched_addr = NULL;  /* Location of patched instructions */
+static uint32_t  poll_patched_saved[2];     /* Original 2 instructions at that location */
 
 #ifdef ENABLE_VRAM_DUMP
 static uint32_t next_vram_dump = 1000000;
@@ -726,9 +728,16 @@ static inline int run_jit_chain(uint64_t deadline)
     uint32_t pc = cpu.pc;
 
     /* Dynamic polling skip: if this PC was seen as a self-loop last time,
-     * skip immediately instead of executing another polling iteration. */
+     * skip immediately instead of executing another polling iteration.
+     * Also restore the patched instruction on the block entry. */
     if (__builtin_expect(pc == poll_detect_pc, 0))
     {
+        /* Restore original instructions if we patched the block */
+        if (poll_patched_addr) {
+            poll_patched_addr[0] = poll_patched_saved[0];
+            poll_patched_addr[1] = poll_patched_saved[1];
+            poll_patched_addr = NULL;
+        }
         poll_detect_pc = 0;
         if (deadline > global_cycles) {
 #ifdef ENABLE_SUBSYSTEM_PROFILER
@@ -882,10 +891,35 @@ static inline int run_jit_chain(uint64_t deadline)
      * it entered (cpu.pc == entry_pc), the block self-looped via DBL
      * until cycles exhausted.  Mark it so the NEXT entry to this PC
      * skips immediately (handled at top of run_jit_chain). */
+    /* Dynamic polling detection: if a chain exits to the same PC it entered,
+     * the block self-looped via DBL until cycles exhausted.  Mark it and
+     * patch the block's DBL entry to abort immediately on next DBL entry,
+     * so that chains reaching this block will exit back to C. */
     if (__builtin_expect(cpu.pc == pc, 0))
+    {
         poll_detect_pc = pc;
+        /* Patch the block's entry point: overwrite first body instruction
+         * with J abort_trampoline.  When any chain reaches this block via
+         * DBL, it will immediately exit instead of executing the loop. */
+        if (!poll_patched_addr && be && be->native) {
+            uint32_t *entry = be->native + DYNAREC_PROLOGUE_WORDS;
+            poll_patched_saved[0] = entry[0];
+            poll_patched_saved[1] = entry[1];
+            entry[0] = MK_J(2, (uint32_t)abort_trampoline_addr >> 2);
+            entry[1] = 0; /* NOP in delay slot */
+            poll_patched_addr = entry;
+        }
+    }
     else
+    {
+        /* Non-self-loop: clear polling state and restore any patch */
+        if (poll_patched_addr) {
+            poll_patched_addr[0] = poll_patched_saved[0];
+            poll_patched_addr[1] = poll_patched_saved[1];
+            poll_patched_addr = NULL;
+        }
         poll_detect_pc = 0;
+    }
 
     return RUN_RES_NORMAL;
 }
