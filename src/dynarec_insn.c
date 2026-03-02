@@ -355,20 +355,20 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
 
             /* Pre-compute rs^rt; save rs via stack to avoid T2 conflict
              * when rd=0 (emit_dst_reg returns REG_T2 as junk dest). */
-            emit(MK_R(0, s1, s2, REG_AT, 0, 0x26));           /* XOR  AT, s1, s2  (rs^rt) */
-            EMIT_SW(s1, 76, REG_SP);                           /* save rs to stack */
+            emit(MK_R(0, s1, s2, REG_AT, 0, 0x26)); /* XOR  AT, s1, s2  (rs^rt) */
+            EMIT_SW(s1, 76, REG_SP);                /* save rs to stack */
 
             int d = emit_dst_reg(rd, REG_T8);
-            EMIT_ADDU(d, s1, s2);                              /* d = rs + rt */
+            EMIT_ADDU(d, s1, s2); /* d = rs + rt */
 
             /* Overflow: ~(rs^rt) & (result^rs), bit31=1 => overflow.
              * Load saved rs into T2 (or T0 when d=T2 to avoid self-XOR).
              * LW scheduled before NOR to hide load-use delay on R5900. */
             int sr = (d == REG_T2) ? REG_T8 : REG_T2;
-            EMIT_LW(sr, 76, REG_SP);                           /* sr = saved rs */
+            EMIT_LW(sr, 76, REG_SP);                          /* sr = saved rs */
             emit(MK_R(0, REG_AT, REG_ZERO, REG_AT, 0, 0x27)); /* NOR  AT, AT, $0 */
-            emit(MK_R(0, d, sr, sr, 0, 0x26));                 /* XOR  sr, d, sr  (result^rs) */
-            emit(MK_R(0, REG_AT, sr, REG_AT, 0, 0x24));        /* AND  AT, AT, sr */
+            emit(MK_R(0, d, sr, sr, 0, 0x26));                /* XOR  sr, d, sr  (result^rs) */
+            emit(MK_R(0, REG_AT, sr, REG_AT, 0, 0x24));       /* AND  AT, AT, sr */
 
             /* BGEZ AT, @no_overflow — placeholder, patched after cold path */
             uint32_t *bgez_patch = code_ptr;
@@ -445,18 +445,18 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
                 EMIT_SW(psx_pinned_reg[rd], CPU_REG(rd), REG_S0);
 
             /* Pre-compute rs^rt; save rs via stack */
-            emit(MK_R(0, s1, s2, REG_AT, 0, 0x26));           /* XOR  AT, s1, s2 */
-            EMIT_SW(s1, 76, REG_SP);                           /* save rs to stack */
+            emit(MK_R(0, s1, s2, REG_AT, 0, 0x26)); /* XOR  AT, s1, s2 */
+            EMIT_SW(s1, 76, REG_SP);                /* save rs to stack */
 
             int d = emit_dst_reg(rd, REG_T8);
-            emit(MK_R(0, s1, s2, d, 0, 0x23));                /* SUBU d, s1, s2 */
+            emit(MK_R(0, s1, s2, d, 0, 0x23)); /* SUBU d, s1, s2 */
 
             /* Overflow: (rs^rt) & (result^rs), bit31=1 => overflow */
             int sr = (d == REG_T2) ? REG_T8 : REG_T2;
-            EMIT_LW(sr, 76, REG_SP);                           /* sr = saved rs */
-            EMIT_NOP();                                        /* load delay */
-            emit(MK_R(0, d, sr, sr, 0, 0x26));                 /* XOR  sr, d, sr */
-            emit(MK_R(0, REG_AT, sr, REG_AT, 0, 0x24));        /* AND  AT, AT, sr */
+            EMIT_LW(sr, 76, REG_SP);                    /* sr = saved rs */
+            EMIT_NOP();                                 /* load delay */
+            emit(MK_R(0, d, sr, sr, 0, 0x26));          /* XOR  sr, d, sr */
+            emit(MK_R(0, REG_AT, sr, REG_AT, 0, 0x24)); /* AND  AT, AT, sr */
 
             uint32_t *bgez_patch = code_ptr;
             emit(0);
@@ -629,18 +629,18 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
         emit_load_imm32(REG_T9, (uint32_t)imm);
 
         /* Pre-compute rs^imm; save rs via stack */
-        emit(MK_R(0, s1, REG_T9, REG_AT, 0, 0x26));       /* XOR  AT, s1, T1 */
-        EMIT_SW(s1, 76, REG_SP);                           /* save rs to stack */
+        emit(MK_R(0, s1, REG_T9, REG_AT, 0, 0x26)); /* XOR  AT, s1, T1 */
+        EMIT_SW(s1, 76, REG_SP);                    /* save rs to stack */
 
         int d = emit_dst_reg(rt, REG_T8);
-        EMIT_ADDU(d, s1, REG_T9);                          /* d = rs + imm */
+        EMIT_ADDU(d, s1, REG_T9); /* d = rs + imm */
 
         /* Overflow: ~(rs^imm) & (result^rs), bit31=1 => overflow */
         int sr = (d == REG_T2) ? REG_T8 : REG_T2;
-        EMIT_LW(sr, 76, REG_SP);                           /* sr = saved rs */
+        EMIT_LW(sr, 76, REG_SP);                          /* sr = saved rs */
         emit(MK_R(0, REG_AT, REG_ZERO, REG_AT, 0, 0x27)); /* NOR  AT, AT, $0 */
-        emit(MK_R(0, d, sr, sr, 0, 0x26));                 /* XOR  sr, d, sr */
-        emit(MK_R(0, REG_AT, sr, REG_AT, 0, 0x24));        /* AND  AT, AT, sr */
+        emit(MK_R(0, d, sr, sr, 0, 0x26));                /* XOR  sr, d, sr */
+        emit(MK_R(0, REG_AT, sr, REG_AT, 0, 0x24));       /* AND  AT, AT, sr */
 
         uint32_t *bgez_patch = code_ptr;
         emit(0);

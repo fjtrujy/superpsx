@@ -132,6 +132,9 @@ static int tlb_bp_count = 0;
 
 void tlb_patch_emit_all(void)
 {
+    /* Suspend dynamic slots — TLB stubs use T0/T1/T2 as address/data */
+    int tlb_dyn_saved = dyn_slots_active;
+    dyn_slots_active = 0;
     int i;
     for (i = 0; i < tlb_bp_count; i++)
     {
@@ -227,6 +230,7 @@ void tlb_patch_emit_all(void)
     }
 
     tlb_bp_count = 0;
+    dyn_slots_active = tlb_dyn_saved;
 }
 
 /*
@@ -273,6 +277,9 @@ int __attribute__((used)) TLB_Backpatch(uint32_t epc)
 
 void cold_slow_emit_all(void)
 {
+    /* Suspend dynamic slots — cold paths use T0/T1/T2 as address/data */
+    int cold_dyn_saved = dyn_slots_active;
+    dyn_slots_active = 0;
     int i;
     for (i = 0; i < cold_count; i++)
     {
@@ -325,6 +332,7 @@ void cold_slow_emit_all(void)
     }
 
     cold_count = 0;
+    dyn_slots_active = cold_dyn_saved;
 }
 
 /*
@@ -353,6 +361,8 @@ void cold_slow_emit_all(void)
  */
 void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_signed)
 {
+    int dyn_was_active = dyn_slots_active;
+    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     uint32_t const_addr = 0;
     int is_const = 0;
@@ -390,7 +400,7 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
 
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            return;
+            goto done;
         }
         /* Scratchpad access? */
         if (phys >= 0x1F800000 && phys < 0x1F800400)
@@ -418,7 +428,7 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
 
                 if (!dynarec_load_defer)
                     emit_store_psx_reg(rt_psx, REG_V0);
-                return;
+                goto done;
             }
         }
 
@@ -432,14 +442,14 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             EMIT_LW(REG_V0, CPU_I_STAT, REG_S0);
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            return;
+            goto done;
         }
         if (phys == 0x1F801074 && size == 4) /* I_MASK */
         {
             EMIT_LW(REG_V0, CPU_I_MASK, REG_S0);
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            return;
+            goto done;
         }
 
         /*
@@ -496,7 +506,7 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             /* Patch fast-path branch */
             int32_t soff_fast = (int32_t)(code_ptr - fast_skip - 1);
             *fast_skip = (*fast_skip & 0xFFFF0000) | ((uint32_t)soff_fast & 0xFFFF);
-            return;
+            goto done;
         }
 
         /*
@@ -511,7 +521,7 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             emit_call_c_lite((uint32_t)SIO_Read);
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            return;
+            goto done;
         }
     }
 
@@ -628,6 +638,11 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
         e->rt_psx = rt_psx;
     }
     reg_cache_invalidate();
+done:
+    if (dyn_was_active) {
+        dyn_slots_active = 1;
+        dyn_reload_slots();
+    }
 }
 
 void emit_memory_read_signed(int size, int rt_psx, int rs_psx, int16_t offset)
@@ -640,6 +655,8 @@ void emit_memory_read_signed(int size, int rt_psx, int rs_psx, int16_t offset)
 
 void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
 {
+    int dyn_was_active = dyn_slots_active;
+    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     uint32_t const_addr = 0;
     int is_const = 0;
@@ -690,7 +707,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
                 int32_t skip = (int32_t)(code_ptr - beq_ptr - 2);
                 *beq_ptr = MK_I(4, REG_T0, REG_ZERO, skip & 0xFFFF);
             }
-            return;
+            goto done_w;
         }
         /* Scratchpad access? */
         if (phys >= 0x1F800000 && phys < 0x1F800400)
@@ -706,7 +723,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
                     EMIT_SH(REG_T2, 0, REG_T1);
                 else
                     EMIT_SB(REG_T2, 0, REG_T1);
-                return;
+                goto done_w;
             }
         }
 
@@ -725,7 +742,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             EMIT_LW(REG_T1, CPU_I_STAT, REG_S0);              /* t1 = cpu.i_stat */
             emit(MK_R(0, REG_T1, data_reg, REG_T1, 0, 0x24)); /* and t1, t1, data */
             EMIT_SW(REG_T1, CPU_I_STAT, REG_S0);              /* cpu.i_stat = t1 */
-            return;
+            goto done_w;
         }
         if (phys == 0x1F801074 && size == 4) /* I_MASK */
         {
@@ -733,7 +750,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             emit_load_imm32(REG_T1, 0xFFFF07FF);
             emit(MK_R(0, REG_T2, REG_T1, REG_T2, 0, 0x24)); /* and t2, t2, t1 */
             EMIT_SW(REG_T2, CPU_I_MASK, REG_S0);
-            return;
+            goto done_w;
         }
 
         /*
@@ -781,7 +798,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             /* @done: patch fast-path branch */
             int32_t doff = (int32_t)(code_ptr - sio_fast_done - 1);
             *sio_fast_done = (*sio_fast_done & 0xFFFF0000) | ((uint32_t)doff & 0xFFFF);
-            return;
+            goto done_w;
         }
 
         /*
@@ -798,7 +815,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             }
             emit_flush_partial_cycles();
             emit_call_c_lite((uint32_t)SIO_Write);
-            return;
+            goto done_w;
         }
     }
 
@@ -899,6 +916,11 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
         e->rt_psx = 0;
     }
     reg_cache_invalidate();
+done_w:
+    if (dyn_was_active) {
+        dyn_slots_active = 1;
+        dyn_reload_slots();
+    }
 }
 
 /*
@@ -912,6 +934,8 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
  */
 void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int use_load_delay)
 {
+    int dyn_was_active = dyn_slots_active;
+    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     /* Load current rt value (merge target) */
     if (use_load_delay)
@@ -968,6 +992,10 @@ void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int us
         e->rt_psx = rt_psx;
     }
     reg_cache_invalidate();
+    if (dyn_was_active) {
+        dyn_slots_active = 1;
+        dyn_reload_slots();
+    }
 }
 
 /*
@@ -980,6 +1008,8 @@ void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int us
  */
 void emit_memory_swx(int is_left, int rt_psx, int rs_psx, int16_t offset)
 {
+    int dyn_was_active = dyn_slots_active;
+    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     /* Compute effective address into T0, data into T2 */
     emit_load_psx_reg(REG_T0, rs_psx);
@@ -1034,4 +1064,8 @@ void emit_memory_swx(int is_left, int rt_psx, int rs_psx, int16_t offset)
         e->rt_psx = 0;
     }
     reg_cache_invalidate();
+    if (dyn_was_active) {
+        dyn_slots_active = 1;
+        dyn_reload_slots();
+    }
 }

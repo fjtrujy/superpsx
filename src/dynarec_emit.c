@@ -44,6 +44,99 @@ void reg_cache_invalidate(void)
     t9_cached_psx_reg = -1;
 }
 
+/* ================================================================
+ *  Dynamic Register Slots — Write-Through T0/T1/T2
+ *
+ *  Each slot maps a frequently-used non-pinned PSX GPR to one of
+ *  T0/T1/T2 for the duration of a compiled block.  The write-through
+ *  protocol ensures cpu.regs[] is always consistent: every store to
+ *  a slot register also emits SW to memory.  This eliminates the need
+ *  for writeback at block exits/abort trampolines.
+ *
+ *  Slots are suspended (disabled) during memory operations and C calls
+ *  that commandeer T0/T1/T2 for their own purposes.  After suspension,
+ *  a reload restores the slot registers from the always-current memory.
+ * ================================================================ */
+static const int dyn_slot_ee[DYN_SLOT_COUNT] = { REG_T0, REG_T1 };
+int dyn_slot_psx[DYN_SLOT_COUNT] = { -1, -1 };
+int dyn_slots_active = 0;
+static int dyn_slots_saved_active = 0;
+
+/* Find the slot index holding PSX reg r, or -1 */
+static inline int dyn_slot_find(int r)
+{
+    if (dyn_slot_psx[0] == r) return 0;
+    if (dyn_slot_psx[1] == r) return 1;
+    return -1;
+}
+
+/* Assign dynamic slots based on block scan register access frequency.
+ * Picks the top-N (up to DYN_SLOT_COUNT) non-pinned PSX GPRs with
+ * the highest access count (minimum 2 accesses to justify a slot). */
+void dyn_assign_slots(BlockScanResult *scan)
+{
+    dyn_slot_psx[0] = dyn_slot_psx[1] = -1;
+    dyn_slots_active = 0;
+
+    int slot = 0;
+    while (slot < DYN_SLOT_COUNT)
+    {
+        int best = -1, best_count = 1; /* require >= 2 accesses */
+        for (int r = 1; r < 32; r++)
+        {
+            if (psx_pinned_reg[r]) continue;
+            if (scan->reg_access_count[r] <= best_count) continue;
+            /* Check not already assigned */
+            int already = 0;
+            for (int s = 0; s < slot; s++)
+                if (dyn_slot_psx[s] == r) { already = 1; break; }
+            if (already) continue;
+            best = r;
+            best_count = scan->reg_access_count[r];
+        }
+        if (best < 0) break;
+        dyn_slot_psx[slot++] = best;
+    }
+    if (slot > 0) dyn_slots_active = 1;
+}
+
+/* Emit LW instructions to load assigned dynamic slots from cpu.regs[].
+ * Called at block entry point (after prologue, before instructions). */
+void dyn_load_slots(void)
+{
+    for (int i = 0; i < DYN_SLOT_COUNT; i++)
+        if (dyn_slot_psx[i] >= 0)
+            EMIT_LW(dyn_slot_ee[i], CPU_REG(dyn_slot_psx[i]), REG_S0);
+}
+
+/* Emit LW instructions to reload dynamic slots from cpu.regs[].
+ * Called after C calls and memory ops that clobber T0/T1/T2. */
+void dyn_reload_slots(void)
+{
+    if (!dyn_slots_active) return;
+    for (int i = 0; i < DYN_SLOT_COUNT; i++)
+        if (dyn_slot_psx[i] >= 0)
+            EMIT_LW(dyn_slot_ee[i], CPU_REG(dyn_slot_psx[i]), REG_S0);
+}
+
+void dyn_reset_slots(void)
+{
+    dyn_slot_psx[0] = dyn_slot_psx[1] = -1;
+    dyn_slots_active = 0;
+    dyn_slots_saved_active = 0;
+}
+
+void dyn_suspend_slots(void)
+{
+    dyn_slots_saved_active = dyn_slots_active;
+    dyn_slots_active = 0;
+}
+
+void dyn_resume_slots(void)
+{
+    dyn_slots_active = dyn_slots_saved_active;
+}
+
 /* Load PSX register 'r' from cpu struct into hw reg 'hwreg' */
 void emit_load_psx_reg(int hwreg, int r)
 {
@@ -70,7 +163,18 @@ void emit_load_psx_reg(int hwreg, int r)
     }
     else
     {
-        /* Non-pinned, non-dirty-const: use scratch cache */
+        /* Check dynamic slot first */
+        if (dyn_slots_active) {
+            int si = dyn_slot_find(r);
+            if (si >= 0) {
+                if (hwreg != dyn_slot_ee[si])
+                    EMIT_MOVE(hwreg, dyn_slot_ee[si]);
+                if (hwreg == REG_T8) t8_cached_psx_reg = -1;
+                else if (hwreg == REG_T9) t9_cached_psx_reg = -1;
+                return;
+            }
+        }
+        /* Non-pinned, non-slot, non-dirty-const: use scratch cache */
         if (hwreg == REG_T8 && t8_cached_psx_reg == r) return;
         if (hwreg == REG_T9 && t9_cached_psx_reg == r) return;
         EMIT_LW(hwreg, CPU_REG(r), REG_S0);
@@ -90,7 +194,14 @@ int emit_use_reg(int r, int scratch)
     if (vregs[r].is_const && vregs[r].is_dirty)
     {
         /* Lazy const: materialize into the canonical location */
-        int dst = psx_pinned_reg[r] ? psx_pinned_reg[r] : scratch;
+        int dst;
+        if (psx_pinned_reg[r]) {
+            dst = psx_pinned_reg[r];
+        } else if (dyn_slots_active && dyn_slot_find(r) >= 0) {
+            dst = dyn_slot_ee[dyn_slot_find(r)];
+        } else {
+            dst = scratch;
+        }
         emit_load_imm32(dst, vregs[r].value);
         if (!psx_pinned_reg[r])
             EMIT_SW(dst, CPU_REG(r), REG_S0);
@@ -103,6 +214,12 @@ int emit_use_reg(int r, int scratch)
     }
     if (psx_pinned_reg[r])
         return psx_pinned_reg[r];
+    /* Check dynamic slot */
+    if (dyn_slots_active) {
+        int si = dyn_slot_find(r);
+        if (si >= 0)
+            return dyn_slot_ee[si];
+    }
     /* Non-pinned: check scratch register cache */
     if (scratch == REG_T8 && t8_cached_psx_reg == r) return REG_T8;
     if (scratch == REG_T9 && t9_cached_psx_reg == r) return REG_T9;
@@ -115,8 +232,15 @@ int emit_use_reg(int r, int scratch)
 int emit_dst_reg(int r, int scratch)
 {
     if (r == 0)
-        return REG_T2; /* Junk register if writing to $0 */
-    return psx_pinned_reg[r] ? psx_pinned_reg[r] : scratch;
+        return REG_T2; /* Junk register if writing to $0 (T2 is scratch, not a dyn slot) */
+    if (psx_pinned_reg[r])
+        return psx_pinned_reg[r];
+    if (dyn_slots_active) {
+        int si = dyn_slot_find(r);
+        if (si >= 0)
+            return dyn_slot_ee[si];
+    }
+    return scratch;
 }
 
 /* Store hw reg 'hwreg' to PSX register 'r' in cpu struct */
@@ -129,6 +253,19 @@ void emit_store_psx_reg(int r, int hwreg)
         if (psx_pinned_reg[r] != hwreg) /* avoid self-move */
             EMIT_MOVE(psx_pinned_reg[r], hwreg);
         return;
+    }
+    /* Dynamic slot: write-through (update slot reg + memory) */
+    if (dyn_slots_active) {
+        int si = dyn_slot_find(r);
+        if (si >= 0) {
+            if (dyn_slot_ee[si] != hwreg)
+                EMIT_MOVE(dyn_slot_ee[si], hwreg);
+            EMIT_SW(dyn_slot_ee[si], CPU_REG(r), REG_S0);
+            /* Invalidate scratch cache if it held this PSX reg */
+            if (t8_cached_psx_reg == r) t8_cached_psx_reg = -1;
+            if (t9_cached_psx_reg == r) t9_cached_psx_reg = -1;
+            return;
+        }
     }
     EMIT_SW(hwreg, CPU_REG(r), REG_S0);
     /* Update cache: hwreg now holds cpu.regs[r] */
@@ -145,6 +282,18 @@ void emit_sync_reg(int r, int host_reg)
 {
     if (r == 0 || psx_pinned_reg[r])
         return;
+    /* Dynamic slot: write-through (update slot reg + memory) */
+    if (dyn_slots_active) {
+        int si = dyn_slot_find(r);
+        if (si >= 0) {
+            if (dyn_slot_ee[si] != host_reg)
+                EMIT_MOVE(dyn_slot_ee[si], host_reg);
+            EMIT_SW(dyn_slot_ee[si], CPU_REG(r), REG_S0);
+            if (t8_cached_psx_reg == r) t8_cached_psx_reg = -1;
+            if (t9_cached_psx_reg == r) t9_cached_psx_reg = -1;
+            return;
+        }
+    }
     EMIT_SW(host_reg, CPU_REG(r), REG_S0);
     /* Update cache: host_reg now holds cpu.regs[r] */
     if (host_reg == REG_T8) {
@@ -176,6 +325,14 @@ void flush_dirty_consts(void)
             if (psx_pinned_reg[r])
             {
                 emit_load_imm32(psx_pinned_reg[r], vregs[r].value);
+            }
+            else if (dyn_slots_active && dyn_slot_find(r) >= 0)
+            {
+                int si = dyn_slot_find(r);
+                emit_load_imm32(dyn_slot_ee[si], vregs[r].value);
+                EMIT_SW(dyn_slot_ee[si], CPU_REG(r), REG_S0);
+                if (t8_cached_psx_reg == r) t8_cached_psx_reg = -1;
+                if (t9_cached_psx_reg == r) t9_cached_psx_reg = -1;
             }
             else
             {
@@ -262,6 +419,7 @@ void emit_call_c(uint32_t func_addr)
     emit_load_imm32(REG_T0, func_addr);
     EMIT_JAL_ABS((uint32_t)call_c_trampoline_addr);
     EMIT_NOP();
+    dyn_reload_slots();
     reg_cache_invalidate();
 }
 
@@ -276,6 +434,7 @@ void emit_call_c_lite(uint32_t func_addr)
     emit_load_imm32(REG_T0, func_addr);
     EMIT_JAL_ABS((uint32_t)call_c_trampoline_lite_addr);
     EMIT_NOP();
+    dyn_reload_slots();
     reg_cache_invalidate();
 }
 
@@ -297,8 +456,9 @@ void emit_call_c_lite(uint32_t func_addr)
  */
 void emit_abort_check(uint32_t cycles)
 {
-    EMIT_LW(REG_T0, CPU_BLOCK_ABORTED, REG_S0); /* t0 = cpu.block_aborted */
-    EMIT_BEQ(REG_T0, REG_ZERO, 4);              /* skip next 3 instrs if zero */
+    /* Use AT instead of T0 to avoid clobbering dynamic slot 0 */
+    EMIT_LW(REG_AT, CPU_BLOCK_ABORTED, REG_S0); /* at = cpu.block_aborted */
+    EMIT_BEQ(REG_AT, REG_ZERO, 4);              /* skip next 3 instrs if zero */
     EMIT_NOP();
 
     /* Inside abort path: subtract only the cycles consumed up to this
@@ -367,6 +527,14 @@ void mark_vreg_var(int r)
     {
         if (psx_pinned_reg[r])
             emit_load_imm32(psx_pinned_reg[r], vregs[r].value);
+        else if (dyn_slots_active && dyn_slot_find(r) >= 0)
+        {
+            int si = dyn_slot_find(r);
+            emit_load_imm32(dyn_slot_ee[si], vregs[r].value);
+            EMIT_SW(dyn_slot_ee[si], CPU_REG(r), REG_S0);
+            if (t8_cached_psx_reg == r) t8_cached_psx_reg = -1;
+            if (t9_cached_psx_reg == r) t9_cached_psx_reg = -1;
+        }
         else
         {
             emit_load_imm32(REG_AT, vregs[r].value);
@@ -400,6 +568,7 @@ void reset_vregs(void)
     memset(vregs, 0, sizeof(vregs));
     dirty_const_mask = 0;
     reg_cache_invalidate();
+    dyn_reset_slots();
     /* $0 is special, but memset already handles it by setting is_const=0.
      * However, is_vreg_const(0) handles it specifically. */
 }
@@ -420,6 +589,12 @@ void emit_cpu_field_to_psx_reg(int field_offset, int r)
     {
         EMIT_LW(psx_pinned_reg[r], field_offset, REG_S0);
     }
+    else if (dyn_slots_active && dyn_slot_find(r) >= 0)
+    {
+        int si = dyn_slot_find(r);
+        EMIT_LW(dyn_slot_ee[si], field_offset, REG_S0);
+        EMIT_SW(dyn_slot_ee[si], CPU_REG(r), REG_S0); /* write-through */
+    }
     else
     {
         EMIT_LW(REG_AT, field_offset, REG_S0);
@@ -437,6 +612,12 @@ void emit_materialize_psx_imm(int r, uint32_t value)
     if (psx_pinned_reg[r])
     {
         emit_load_imm32(psx_pinned_reg[r], value);
+    }
+    else if (dyn_slots_active && dyn_slot_find(r) >= 0)
+    {
+        int si = dyn_slot_find(r);
+        emit_load_imm32(dyn_slot_ee[si], value);
+        EMIT_SW(dyn_slot_ee[si], CPU_REG(r), REG_S0); /* write-through */
     }
     else
     {

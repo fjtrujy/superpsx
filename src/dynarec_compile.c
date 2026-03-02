@@ -507,12 +507,23 @@ void block_scan(const uint32_t *code, int max_insns, BlockScanResult *out)
     }
     out->insn_count = count;
 
-    /* Phase 2: forward pass — compute reg read/write masks */
+    /* Phase 2: forward pass — compute reg read/write masks + access counts */
     uint32_t written = 0, read = 0;
+    memset(out->reg_access_count, 0, sizeof(out->reg_access_count));
     for (int i = 0; i < count; i++)
     {
-        written |= scan_write_mask(code[i]);
-        read |= dce_read_mask(code[i]);
+        uint32_t wmask = scan_write_mask(code[i]);
+        uint32_t rmask = dce_read_mask(code[i]);
+        written |= wmask;
+        read |= rmask;
+        /* Count unique per-instruction register accesses (read or write) */
+        uint32_t amask = rmask | wmask;
+        while (amask) {
+            int r = __builtin_ctz(amask);
+            amask &= amask - 1;
+            if (out->reg_access_count[r] < 255)
+                out->reg_access_count[r]++;
+        }
     }
     out->regs_written_mask = written;
     out->regs_read_mask = read;
@@ -690,6 +701,8 @@ uint32_t *compile_block(uint32_t psx_pc)
     block_scan(psx_code, SCAN_MAX_INSNS, &scan);
     block_pinned_dirty_mask = scan.pinned_written_mask;
     emit_block_prologue();
+    dyn_assign_slots(&scan);
+    dyn_load_slots();
 
     /* Inject BIOS HLE hooks natively so that DBL jumps do not bypass them.
      * Charge a nominal 10 cycles for HLE overhead (the block's instructions
@@ -864,6 +877,9 @@ uint32_t *compile_block(uint32_t psx_pc)
                     dt->branch_insn = code_ptr;
                     emit(MK_I(0x05, REG_T2, REG_ZERO, 0)); /* BNE t2, zero, @taken */
                     EMIT_NOP();
+
+                    /* Reload dynamic slots (T2 clobbered by branch condition) */
+                    dyn_reload_slots();
 
                     /* Fall-through: continue compiling next sub-block.
                      * vregs carry over — const propagation across fall-through. */

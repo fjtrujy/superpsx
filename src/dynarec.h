@@ -29,6 +29,7 @@
 #define PATCH_SITE_MAX 8192
 
 #define SCAN_MAX_INSNS 64 /* Max instructions analyzed per block scan */
+#define DYN_SLOT_COUNT 2   /* Dynamic register slots: T0, T1 (T2 reserved for scratch) */
 
 /* ================================================================
  *  Shared types
@@ -67,6 +68,7 @@ typedef struct {
     uint32_t regs_written_mask;   /* bit r=1 → PSX reg r is written (any) */
     uint32_t regs_read_mask;      /* bit r=1 → PSX reg r is read */
     int insn_count;               /* Number of PSX instructions in block (incl. delay slot) */
+    uint8_t reg_access_count[32]; /* per-reg instruction access frequency (capped 255) */
 } BlockScanResult;
 
 typedef int32_t (*block_func_t)(R3000CPU *cpu, uint8_t *ram, uint8_t *bios, int32_t cycles_left);
@@ -368,6 +370,20 @@ void flush_dirty_consts(void);
 extern int t8_cached_psx_reg;
 extern int t9_cached_psx_reg;
 void reg_cache_invalidate(void);
+
+/* Dynamic register slots — write-through T0/T1/T2.
+ * Per-block allocation: top-N non-pinned regs mapped to T0/T1/T2.
+ * Write-through: every store updates both slot reg AND cpu.regs[],
+ * so memory is always consistent — no writeback needed on exits.
+ * Slots suspended during memory ops and C calls that clobber T0/T1/T2. */
+extern int dyn_slot_psx[DYN_SLOT_COUNT];
+extern int dyn_slots_active;
+void dyn_assign_slots(BlockScanResult *scan);
+void dyn_load_slots(void);
+void dyn_reload_slots(void);
+void dyn_reset_slots(void);
+void dyn_suspend_slots(void);
+void dyn_resume_slots(void);
 
 /* Compile-loop helpers: use AT instead of T8/T9 for non-GPR temporaries */
 void emit_cpu_field_to_psx_reg(int field_offset, int r);
