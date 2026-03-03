@@ -25,7 +25,7 @@ perl -e 'alarm 60; exec @ARGV' make -C build run GAMEARGS=tests/gte/test-all/tes
 grep -E "Passed|Failed" | head -5; \
 rm -f build/superpsx.ini && ln -s $(pwd)/superpsx.ini build/superpsx.ini
 
-# CPU test (expect: 227)
+# CPU test (expect: 0, Result end in 101)
 perl -e 'alarm 120; exec @ARGV' make -C build run GAMEARGS=tests/psxtest_cpu/psxtest_cpu.exe 2>&1 | grep -c "error"
 
 # Timer test
@@ -40,6 +40,7 @@ make -C build run GAMEARGS=isos/CrashBandicoot/CrashBandicoot.cue
 ## Testing Protocol
 
 Before committing ANY change to the dynarec or emulation core:
+
 1. Build must succeed with zero warnings (except known ones in tlb_handler.c when TLB disabled)
 2. GTE: 1150 passed, 0 failed
 3. CPU: 227 (known deviation count — must not change)
@@ -56,6 +57,7 @@ Before committing ANY change to the dynarec or emulation core:
 ## JIT Register Allocation
 
 13 PSX registers are permanently pinned to EE hardware registers:
+
 - v0→S6, v1→V1, a0-a3→T3-T6, t0-t2→T7-T9, gp→FP, sp→S4, s8→S7, ra→S5
 - Infrastructure: S0=cpu ptr, S1=RAM/TLB base, S2=cycles, S3=mask(0x1FFFFFFF)
 - Scratch: T0, T1, T2, AT (T0/T1 have a scratch cache for non-pinned regs)
@@ -65,6 +67,7 @@ The other 19 PSX GPRs go through `LW/SW` to `cpu.regs[]` (offset from S0).
 ## Code Buffer Layout
 
 Trampolines at fixed offsets in `code_buffer[]`:
+
 - [0]: slow-path, [2]: abort, [32]: full C-call, [68]: lite C-call, [96]: jump dispatch, [128]: mem slow-path
 - JIT blocks start at [144+]
 - `DYNAREC_PROLOGUE_WORDS = 29` (skip in direct block links)
@@ -84,3 +87,16 @@ See `docs/jit_optimization_roadmap.md`. Next major task: refactor to 2-pass comp
 - Always `git add -A && git diff --cached --stat` before committing to review changes.
 - Use descriptive commit messages with test results (GTE/CPU/Timer).
 - Force push only when user requests (with `--force-with-lease`).
+
+## JIT Debugging Methodology (Chain-of-Thought)
+
+When a JIT change causes a regression:
+
+1. **Always dump generated code** — don't guess what the JIT emits. Add hex/disasm dumps of:
+   - Trampoline regions (code_buffer[32..143]) at init time
+   - Compiled blocks (first N blocks: PC, native word count, hex dump)
+   - Cold-slow / TLB stubs (generated per-block at end of compilation)
+2. **Compare dumps** between working and broken versions before forming hypotheses.
+3. **Analyze the actual instruction stream** — trace register usage, verify delay slots, check branch offsets.
+4. **Bisection + Code Analysis**: bisect to narrow down the failing code region, then dump the exact generated code to identify the root cause. Don't rely solely on test pass/fail — read the actual machine instructions.
+5. This is a CoT (Chain-of-Thought) approach: hypothesize → verify with data → refine → fix.

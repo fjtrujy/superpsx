@@ -868,18 +868,17 @@ uint32_t *compile_block(uint32_t psx_pc)
                 if (can_continue)
                 {
                     /* Emit BNE cond → @taken (forward ref, patched later) */
-                    EMIT_LW(REG_T2, 72, REG_SP);
+                    EMIT_LW(REG_AT, 72, REG_SP);
                     DeferredTakenEntry *dt = &deferred_taken[deferred_taken_count++];
                     dt->target_pc = branch_target;
                     dt->cycle_count = block_cycle_count;
                     memcpy(dt->saved_vregs, vregs, sizeof(vregs));
                     dt->saved_dirty_mask = dirty_const_mask;
                     dt->branch_insn = code_ptr;
-                    emit(MK_I(0x05, REG_T2, REG_ZERO, 0)); /* BNE t2, zero, @taken */
+                    emit(MK_I(0x05, REG_AT, REG_ZERO, 0)); /* BNE at, zero, @taken */
                     EMIT_NOP();
 
-                    /* Reload dynamic slots (T2 clobbered by branch condition) */
-                    dyn_reload_slots();
+                    /* Slots intact (AT used for condition, not T0/T1/T2) */
 
                     /* Fall-through: continue compiling next sub-block.
                      * vregs carry over — const propagation across fall-through. */
@@ -895,9 +894,9 @@ uint32_t *compile_block(uint32_t psx_pc)
                 else
                 {
                     /* Standard two-path epilogue (no more continuations) */
-                    EMIT_LW(REG_T2, 72, REG_SP);
+                    EMIT_LW(REG_AT, 72, REG_SP);
                     uint32_t *bp = code_ptr;
-                    emit(MK_I(0x05, REG_T2, REG_ZERO, 0)); /* BNE t2, zero, 0 */
+                    emit(MK_I(0x05, REG_AT, REG_ZERO, 0)); /* BNE at, zero, 0 */
                     EMIT_NOP();
 
                     RegStatus saved_vregs[32];
@@ -920,9 +919,9 @@ uint32_t *compile_block(uint32_t psx_pc)
             else if (branch_type == 3)
             {
                 /* Register jump (JR/JALR): Inline hash dispatch.
-                 * T0 is required by jump_dispatch_trampoline (hash computation). */
+                 * T8 is required by jump_dispatch_trampoline (hash computation). */
                 flush_dirty_consts();
-                EMIT_LW(REG_T0, CPU_PC, REG_S0);
+                EMIT_LW(REG_T8, CPU_PC, REG_S0);
                 EMIT_ADDIU(REG_S2, REG_S2, -(int16_t)block_cycle_count);
                 EMIT_J_ABS((uint32_t)jump_dispatch_trampoline_addr);
                 EMIT_NOP();
@@ -1057,21 +1056,21 @@ uint32_t *compile_block(uint32_t psx_pc)
             if (op == 0x04 || op == 0x05)
             {
                 emit_load_psx_reg(REG_T9, rt);
-                emit(MK_R(0, REG_T8, REG_T9, REG_T2, 0, 0x26)); /* XOR t2, t0, t1 */
+                emit(MK_R(0, REG_T8, REG_T9, REG_AT, 0, 0x26)); /* XOR at, t8, t9 */
                 if (op == 0x04)
                 {
-                    emit(MK_I(0x0B, REG_T2, REG_T2, 1)); /* SLTIU t2, t2, 1 */
+                    emit(MK_I(0x0B, REG_AT, REG_AT, 1)); /* SLTIU at, at, 1 */
                 }
             }
             else if (op == 0x06)
             {
-                emit(MK_I(0x0A, REG_T8, REG_T2, 1)); /* SLTI t2, t0, 1 */
+                emit(MK_I(0x0A, REG_T8, REG_AT, 1)); /* SLTI at, t8, 1 */
             }
             else if (op == 0x07)
             {
-                emit(MK_R(0, REG_ZERO, REG_T8, REG_T2, 0, 0x2A)); /* SLT t2, zero, t0 */
+                emit(MK_R(0, REG_ZERO, REG_T8, REG_AT, 0, 0x2A)); /* SLT at, zero, t8 */
             }
-            EMIT_SW(REG_T2, 72, REG_SP); /* save cond to stack across delay slot */
+            EMIT_SW(REG_AT, 72, REG_SP); /* save cond to stack across delay slot */
 
             branch_type = 4;
             in_delay_slot = 1;
@@ -1144,14 +1143,14 @@ uint32_t *compile_block(uint32_t psx_pc)
 
             if ((rt & 1) == 0)
             {
-                emit(MK_R(0, REG_T8, REG_ZERO, REG_T2, 0, 0x2A)); /* SLT t2, t0, zero */
+                emit(MK_R(0, REG_T8, REG_ZERO, REG_AT, 0, 0x2A)); /* SLT at, t8, zero */
             }
             else
             {
-                emit(MK_R(0, REG_T8, REG_ZERO, REG_T2, 0, 0x2A));
-                emit(MK_I(0x0E, REG_T2, REG_T2, 1)); /* XORI t2, t2, 1 */
+                emit(MK_R(0, REG_T8, REG_ZERO, REG_AT, 0, 0x2A));
+                emit(MK_I(0x0E, REG_AT, REG_AT, 1)); /* XORI at, at, 1 */
             }
-            EMIT_SW(REG_T2, 72, REG_SP); /* save cond to stack across delay slot */
+            EMIT_SW(REG_AT, 72, REG_SP); /* save cond to stack across delay slot */
 
             branch_type = 4;
             in_delay_slot = 1;

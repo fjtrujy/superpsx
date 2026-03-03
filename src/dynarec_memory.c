@@ -26,7 +26,7 @@ extern uint64_t gpu_busy_until;
  * This allows timer reads/writes during C helper calls to see accurate
  * cycle counts instead of stale global_cycles.
  *
- * Uses REG_AT and REG_T1 (assembler temp, not pinned) as scratch.
+ * Uses REG_AT and REG_T9 as scratch (avoids clobbering dynamic slot regs T0/T1/T2).
  * Cost: 3 native instructions on the slow path.
  *
  * Note: LUI loads the upper half; SW/LW sign-extend the 16-bit offset.
@@ -40,8 +40,8 @@ void emit_flush_partial_cycles(void)
     uint16_t hi = (addr + 0x8000) >> 16;
     uint32_t val = emit_cycle_offset;
     EMIT_LUI(REG_AT, hi);
-    EMIT_ADDIU(REG_T1, REG_ZERO, (int16_t)val);
-    EMIT_SW(REG_T1, (int16_t)lo, REG_AT);
+    EMIT_ADDIU(REG_T9, REG_ZERO, (int16_t)val);
+    EMIT_SW(REG_T9, (int16_t)lo, REG_AT);
 }
 
 /* ================================================================
@@ -132,9 +132,6 @@ static int tlb_bp_count = 0;
 
 void tlb_patch_emit_all(void)
 {
-    /* Suspend dynamic slots — TLB stubs use T0/T1/T2 as address/data */
-    int tlb_dyn_saved = dyn_slots_active;
-    dyn_slots_active = 0;
     int i;
     for (i = 0; i < tlb_bp_count; i++)
     {
@@ -150,40 +147,45 @@ void tlb_patch_emit_all(void)
             m->stub_addr       = (uint32_t)stub_start;
         }
 
-        /* --- Range-checked fast path (RAM via TLB) --- */
-        /* t1 already has phys = vaddr & 0x1FFFFFFF (computed by 'and' still in the hot path) */
-        emit(MK_R(0, 0, REG_T1, REG_A0, 21, 0x02));     /* srl  a0, t1, 21      */
+        /* --- Range-checked fast path (RAM via TLB) ---
+         * Inline fast path registers:
+         *   Reads:  T9 = phys (from 'and t9, t8, s3'), T8 = vaddr
+         *   Writes: AT = phys (from 'and at, t8, s3'), T8 = vaddr, T9 = data
+         */
+        int phys_reg = (e->type == 0) ? REG_T9 : REG_AT;
+
+        emit(MK_R(0, 0, phys_reg, REG_A0, 21, 0x02));   /* srl  a0, phys, 21    */
         uint32_t *io_branch = code_ptr;
         emit(MK_I(0x05, REG_A0, REG_ZERO, 0));           /* bne  a0, zero, @io   */
-        EMIT_ADDU(REG_T1, REG_T1, REG_S1);               /* [delay] addu t1,t1,s1 */
+        EMIT_ADDU(phys_reg, phys_reg, REG_S1);            /* [delay] addu phys,phys,s1 */
 
         /* TLB RAM fast path: inline load/store */
         if (e->type == 0) /* read */
         {
             if (e->size == 4)
-                EMIT_LW(REG_V0, 0, REG_T1);
+                EMIT_LW(REG_V0, 0, phys_reg);
             else if (e->size == 2)
             {
-                if (e->is_signed) EMIT_LH(REG_V0, 0, REG_T1);
-                else              EMIT_LHU(REG_V0, 0, REG_T1);
+                if (e->is_signed) EMIT_LH(REG_V0, 0, phys_reg);
+                else              EMIT_LHU(REG_V0, 0, phys_reg);
             }
             else
             {
-                if (e->is_signed) EMIT_LB(REG_V0, 0, REG_T1);
-                else              EMIT_LBU(REG_V0, 0, REG_T1);
+                if (e->is_signed) EMIT_LB(REG_V0, 0, phys_reg);
+                else              EMIT_LBU(REG_V0, 0, phys_reg);
             }
             /* Store result same as fast path */
             if (!e->load_defer)
                 emit_store_psx_reg(e->rt_psx, REG_V0);
         }
-        else /* write */
+        else /* write: data in T9, pointer in AT */
         {
-            if (e->size == 4)      EMIT_SW(REG_T2, 0, REG_T1);
-            else if (e->size == 2) EMIT_SH(REG_T2, 0, REG_T1);
-            else                   EMIT_SB(REG_T2, 0, REG_T1);
+            if (e->size == 4)      EMIT_SW(REG_T9, 0, phys_reg);
+            else if (e->size == 2) EMIT_SH(REG_T9, 0, phys_reg);
+            else                   EMIT_SB(REG_T9, 0, phys_reg);
         }
 
-        /* Branch back to return point */
+        /* Branch back to return point (TLB RAM path doesn't clobber slots) */
         {
             int32_t ret_off = (int32_t)(e->return_point - code_ptr - 1);
             emit(MK_I(0x04, REG_ZERO, REG_ZERO, (uint16_t)(ret_off & 0xFFFF)));
@@ -196,14 +198,14 @@ void tlb_patch_emit_all(void)
             *io_branch = (*io_branch & 0xFFFF0000) | ((uint32_t)io_off & 0xFFFF);
         }
 
-        EMIT_MOVE(REG_A0, REG_T0);
+        EMIT_MOVE(REG_A0, REG_T8); /* a0 = PSX address (from T8) */
         if (e->type == 1) /* write */
-            EMIT_MOVE(REG_A1, REG_T2);
+            EMIT_MOVE(REG_A1, REG_T9); /* a1 = data (from T9) */
 
-        /* Flush partial cycles */
-        emit_load_imm32(REG_T0, e->func_addr);
-        emit_load_imm32(REG_T2, e->psx_pc);
-        EMIT_ADDIU(REG_T1, REG_ZERO, (int16_t)e->cycle_offset);
+        /* Set up trampoline args: T8=func_addr, T9=cycle_offset, AT=psx_pc */
+        emit_load_imm32(REG_T8, e->func_addr);
+        emit_load_imm32(REG_AT, e->psx_pc);
+        EMIT_ADDIU(REG_T9, REG_ZERO, (int16_t)e->cycle_offset);
         EMIT_JAL_ABS((uint32_t)mem_slow_trampoline_addr);
         EMIT_NOP();
 
@@ -221,6 +223,8 @@ void tlb_patch_emit_all(void)
         if (e->type == 0 && !e->load_defer)
             emit_store_psx_reg(e->rt_psx, REG_V0);
 
+        /* T0/T1/T2 preserved by lite trampoline save/restore */
+
         /* Branch back to return point */
         {
             int32_t ret_off = (int32_t)(e->return_point - code_ptr - 1);
@@ -230,7 +234,6 @@ void tlb_patch_emit_all(void)
     }
 
     tlb_bp_count = 0;
-    dyn_slots_active = tlb_dyn_saved;
 }
 
 /*
@@ -277,9 +280,6 @@ int __attribute__((used)) TLB_Backpatch(uint32_t epc)
 
 void cold_slow_emit_all(void)
 {
-    /* Suspend dynamic slots — cold paths use T0/T1/T2 as address/data */
-    int cold_dyn_saved = dyn_slots_active;
-    dyn_slots_active = 0;
     int i;
     for (i = 0; i < cold_count; i++)
     {
@@ -294,17 +294,19 @@ void cold_slow_emit_all(void)
                              | ((uint32_t)off & 0xFFFF);
         }
 
-        /* Emit slow path: set up args and call mem_slow_trampoline */
-        EMIT_MOVE(REG_A0, REG_T0); /* a0 = PSX address (always in T0) */
+        /* Emit slow path: set up args and call mem_slow_trampoline.
+         * Inline fast path now uses T8=address, T9=data.
+         * Trampoline protocol: T8=func_addr, T9=cycle_offset, AT=psx_pc. */
+        EMIT_MOVE(REG_A0, REG_T8); /* a0 = PSX address (from T8) */
 
         if (e->type == 1 || e->type == 3)
-            EMIT_MOVE(REG_A1, REG_T2); /* a1 = data (writes/SWX) */
+            EMIT_MOVE(REG_A1, REG_T9); /* a1 = data (writes/SWX from T9) */
         else if (e->type == 2)
             EMIT_MOVE(REG_A1, REG_V0); /* a1 = current RT (LWX merge) */
 
-        emit_load_imm32(REG_T0, e->func_addr);
-        emit_load_imm32(REG_T2, e->psx_pc);
-        EMIT_ADDIU(REG_T1, REG_ZERO, (int16_t)e->cycle_offset);
+        emit_load_imm32(REG_T8, e->func_addr);
+        emit_load_imm32(REG_AT, e->psx_pc);
+        EMIT_ADDIU(REG_T9, REG_ZERO, (int16_t)e->cycle_offset);
         EMIT_JAL_ABS((uint32_t)mem_slow_trampoline_addr);
         EMIT_NOP();
 
@@ -323,6 +325,8 @@ void cold_slow_emit_all(void)
         if ((e->type == 0 || e->type == 2) && !e->load_defer)
             emit_store_psx_reg(e->rt_psx, REG_V0);
 
+        /* T0/T1/T2 preserved by lite trampoline save/restore */
+
         /* Branch back to return point */
         {
             int32_t ret_off = (int32_t)(e->return_point - code_ptr - 1);
@@ -332,7 +336,6 @@ void cold_slow_emit_all(void)
     }
 
     cold_count = 0;
-    dyn_slots_active = cold_dyn_saved;
 }
 
 /*
@@ -361,8 +364,6 @@ void cold_slow_emit_all(void)
  */
 void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_signed)
 {
-    int dyn_was_active = dyn_slots_active;
-    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     uint32_t const_addr = 0;
     int is_const = 0;
@@ -379,28 +380,28 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
         /* Aligned RAM access? */
         if ((phys < PSX_RAM_SIZE) && (phys % size == 0))
         {
-            /* Use T1 as scratch for large address */
-            emit_load_imm32(REG_T1, (uint32_t)psx_ram + phys);
+            /* Use T9 as scratch for large address (avoids clobbering dyn slots T0/T1/T2) */
+            emit_load_imm32(REG_T9, (uint32_t)psx_ram + phys);
             if (size == 4)
-                EMIT_LW(REG_V0, 0, REG_T1);
+                EMIT_LW(REG_V0, 0, REG_T9);
             else if (size == 2)
             {
                 if (is_signed)
-                    emit(MK_I(0x21, REG_T1, REG_V0, 0)); /* LH */
+                    emit(MK_I(0x21, REG_T9, REG_V0, 0)); /* LH */
                 else
-                    EMIT_LHU(REG_V0, 0, REG_T1);
+                    EMIT_LHU(REG_V0, 0, REG_T9);
             }
             else
             {
                 if (is_signed)
-                    emit(MK_I(0x20, REG_T1, REG_V0, 0)); /* LB */
+                    emit(MK_I(0x20, REG_T9, REG_V0, 0)); /* LB */
                 else
-                    EMIT_LBU(REG_V0, 0, REG_T1);
+                    EMIT_LBU(REG_V0, 0, REG_T9);
             }
 
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            goto done;
+            return;
         }
         /* Scratchpad access? */
         if (phys >= 0x1F800000 && phys < 0x1F800400)
@@ -408,27 +409,27 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             uint32_t sp_off = phys & 0x3FF;
             if (sp_off % size == 0)
             {
-                emit_load_imm32(REG_T1, (uint32_t)scratchpad_buf + sp_off);
+                emit_load_imm32(REG_T9, (uint32_t)scratchpad_buf + sp_off);
                 if (size == 4)
-                    EMIT_LW(REG_V0, 0, REG_T1);
+                    EMIT_LW(REG_V0, 0, REG_T9);
                 else if (size == 2)
                 {
                     if (is_signed)
-                        emit(MK_I(0x21, REG_T1, REG_V0, 0)); /* LH */
+                        emit(MK_I(0x21, REG_T9, REG_V0, 0)); /* LH */
                     else
-                        EMIT_LHU(REG_V0, 0, REG_T1);
+                        EMIT_LHU(REG_V0, 0, REG_T9);
                 }
                 else
                 {
                     if (is_signed)
-                        emit(MK_I(0x20, REG_T1, REG_V0, 0)); /* LB */
+                        emit(MK_I(0x20, REG_T9, REG_V0, 0)); /* LB */
                     else
-                        EMIT_LBU(REG_V0, 0, REG_T1);
+                        EMIT_LBU(REG_V0, 0, REG_T9);
                 }
 
                 if (!dynarec_load_defer)
                     emit_store_psx_reg(rt_psx, REG_V0);
-                goto done;
+                return;
             }
         }
 
@@ -442,14 +443,14 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             EMIT_LW(REG_V0, CPU_I_STAT, REG_S0);
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            goto done;
+            return;
         }
         if (phys == 0x1F801074 && size == 4) /* I_MASK */
         {
             EMIT_LW(REG_V0, CPU_I_MASK, REG_S0);
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            goto done;
+            return;
         }
 
         /*
@@ -464,28 +465,28 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
              * to prevent compile-time dirty-flag leak across paths */
             flush_dirty_consts();
             /* Check gpu_busy_until == 0 (both halves) */
-            emit_load_imm32(REG_T2, (uint32_t)&gpu_busy_until);
-            EMIT_LW(REG_T1, 0, REG_T2);      /* t1 = low 32 bits  */
-            EMIT_LW(REG_T2, 4, REG_T2);      /* t2 = high 32 bits */
-            EMIT_OR(REG_T1, REG_T1, REG_T2); /* t1 = low | high   */
+            emit_load_imm32(REG_T8, (uint32_t)&gpu_busy_until);
+            EMIT_LW(REG_T9, 0, REG_T8);      /* t9 = low 32 bits  */
+            EMIT_LW(REG_T8, 4, REG_T8);      /* t8 = high 32 bits */
+            EMIT_OR(REG_T9, REG_T9, REG_T8); /* t9 = low | high   */
             uint32_t *gbu_slow = code_ptr;
-            EMIT_BNE(REG_T1, REG_ZERO, 0); /* bne t1, $0, @slow */
+            EMIT_BNE(REG_T9, REG_ZERO, 0); /* bne t9, $0, @slow */
             EMIT_NOP();
 
             /* Fast path: v0 = gpu_stat | forced_bits (including dynamic bit 25) */
-            emit_load_imm32(REG_T2, (uint32_t)&gpu_stat);
-            EMIT_LW(REG_V0, 0, REG_T2);
+            emit_load_imm32(REG_T8, (uint32_t)&gpu_stat);
+            EMIT_LW(REG_V0, 0, REG_T8);
             /* Compute bit 25 (DMA data request) from dma_dir (bits 29-30).
              * Per psx-spx: dir=0→0, dir=1/2→1, dir=3→bit27.
              * Simplified: (dma_dir != 0) → 1.  Games poll this before DMA. */
-            emit(MK_R(0, 0, REG_V0, REG_T1, 29, 0x02));       /* srl t1, v0, 29  */
-            emit(MK_I(0x0C, REG_T1, REG_T1, 3));              /* andi t1, t1, 3  */
-            emit(MK_R(0, REG_ZERO, REG_T1, REG_T1, 0, 0x2B)); /* sltu t1, $0, t1 */
-            emit(MK_R(0, 0, REG_T1, REG_T1, 25, 0x00));       /* sll t1, t1, 25  */
-            EMIT_LUI(REG_T2, 0x1400);
-            EMIT_ORI(REG_T2, REG_T2, 0x2000);
-            EMIT_OR(REG_T2, REG_T2, REG_T1); /* t2 = 0x14002000 | bit25 */
-            EMIT_OR(REG_V0, REG_V0, REG_T2);
+            emit(MK_R(0, 0, REG_V0, REG_T9, 29, 0x02));       /* srl t9, v0, 29  */
+            emit(MK_I(0x0C, REG_T9, REG_T9, 3));              /* andi t9, t9, 3  */
+            emit(MK_R(0, REG_ZERO, REG_T9, REG_T9, 0, 0x2B)); /* sltu t9, $0, t9 */
+            emit(MK_R(0, 0, REG_T9, REG_T9, 25, 0x00));       /* sll t9, t9, 25  */
+            EMIT_LUI(REG_T8, 0x1400);
+            EMIT_ORI(REG_T8, REG_T8, 0x2000);
+            EMIT_OR(REG_T8, REG_T8, REG_T9); /* t8 = 0x14002000 | bit25 */
+            EMIT_OR(REG_V0, REG_V0, REG_T8);
 
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
@@ -506,7 +507,7 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             /* Patch fast-path branch */
             int32_t soff_fast = (int32_t)(code_ptr - fast_skip - 1);
             *fast_skip = (*fast_skip & 0xFFFF0000) | ((uint32_t)soff_fast & 0xFFFF);
-            goto done;
+            return;
         }
 
         /*
@@ -521,14 +522,14 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
             emit_call_c_lite((uint32_t)SIO_Read);
             if (!dynarec_load_defer)
                 emit_store_psx_reg(rt_psx, REG_V0);
-            goto done;
+            return;
         }
     }
 
     /* Fallback to generic emitter if address is not constant or not in RAM/SP */
-    /* Compute effective address into REG_T0 */
-    emit_load_psx_reg(REG_T0, rs_psx);
-    EMIT_ADDIU(REG_T0, REG_T0, offset);
+    /* Compute effective address into REG_T8 */
+    emit_load_psx_reg(REG_T8, rs_psx);
+    EMIT_ADDIU(REG_T8, REG_T8, offset);
 
     /* Flush lazy consts before conditional fast/slow split
      * to prevent compile-time dirty-flag leak across paths */
@@ -537,11 +538,11 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
     /*
      * Direct address fast path (cold slow path):
      *   [alignment check if size > 1]
-     *   and    t1, t0, s3          # phys = addr & 0x1FFFFFFF (S3 pinned)
-     *   srl    t2, t1, 21          # 0 if phys < 2MB
-     *   bne    t2, zero, @cold     # range miss → deferred slow path
-     *   addu   t1, t1, s1          # [delay] host = psx_ram + phys
-     *   lw/lhu/lbu v0, 0(t1)
+     *   and    t9, t8, s3          # phys = addr & 0x1FFFFFFF (S3 pinned)
+     *   srl    at, t9, 21          # 0 if phys < 2MB
+     *   bne    at, zero, @cold     # range miss → deferred slow path
+     *   addu   t9, t9, s1          # [delay] host = psx_ram + phys
+     *   lw/lhu/lbu v0, 0(t9)
      *   [store result]             # fast path falls through — no b @done!
      * @cold: <emitted at end of block>
      */
@@ -550,16 +551,16 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
     if (size > 1)
     {
         /* Alignment check — use delay slot for phys mask.
-         * BNE reads T1 before the delay slot AND overwrites it. */
-        emit(MK_I(0x0C, REG_T0, REG_T1, size - 1));         /* andi  t1, t0, size-1 */
+         * BNE reads T9 before the delay slot AND overwrites it. */
+        emit(MK_I(0x0C, REG_T8, REG_T9, size - 1));         /* andi  t9, t8, size-1 */
         align_branch = code_ptr;
-        emit(MK_I(0x05, REG_T1, REG_ZERO, 0));              /* bne   t1, zero, @cold */
-        emit(MK_R(0, REG_T0, REG_S3, REG_T1, 0, 0x24));    /* [delay] and t1, t0, s3 (phys) */
+        emit(MK_I(0x05, REG_T9, REG_ZERO, 0));              /* bne   t9, zero, @cold */
+        emit(MK_R(0, REG_T8, REG_S3, REG_T9, 0, 0x24));    /* [delay] and t9, t8, s3 (phys) */
     }
     else
     {
         /* No alignment check for byte loads */
-        emit(MK_R(0, REG_T0, REG_S3, REG_T1, 0, 0x24));    /* and  t1, t0, s3  (phys) */
+        emit(MK_R(0, REG_T8, REG_S3, REG_T9, 0, 0x24));    /* and  t9, t8, s3  (phys) */
     }
 
     /* Range check: non-RAM (phys >= 2MB) goes to cold path via C helpers.
@@ -568,28 +569,28 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
     uint32_t *range_branch = NULL;
     if (rs_psx != 29) /* $sp always in RAM — skip range check */
     {
-        emit(MK_R(0, 0, REG_T1, REG_T2, 21, 0x02));  /* srl  t2, t1, 21      */
+        emit(MK_R(0, 0, REG_T9, REG_AT, 21, 0x02));  /* srl  at, t9, 21      */
         range_branch = code_ptr;
-        emit(MK_I(0x05, REG_T2, REG_ZERO, 0));        /* bne  t2, zero, @cold */
+        emit(MK_I(0x05, REG_AT, REG_ZERO, 0));        /* bne  at, zero, @cold */
     }
     uint32_t *bp_addu = code_ptr;  /* record for TLB backpatch */
-    EMIT_ADDU(REG_T1, REG_T1, REG_S1);            /* [delay/inline] addu t1, t1, s1 */
+    EMIT_ADDU(REG_T9, REG_T9, REG_S1);            /* [delay/inline] addu t9, t9, s1 */
     uint32_t *bp_fault = code_ptr; /* record: the load that may TLB-miss */
     if (size == 4)
-        EMIT_LW(REG_V0, 0, REG_T1);
+        EMIT_LW(REG_V0, 0, REG_T9);
     else if (size == 2)
     {
         if (is_signed)
-            EMIT_LH(REG_V0, 0, REG_T1); /* native signed halfword load */
+            EMIT_LH(REG_V0, 0, REG_T9); /* native signed halfword load */
         else
-            EMIT_LHU(REG_V0, 0, REG_T1);
+            EMIT_LHU(REG_V0, 0, REG_T9);
     }
     else
     {
         if (is_signed)
-            EMIT_LB(REG_V0, 0, REG_T1); /* native signed byte load */
+            EMIT_LB(REG_V0, 0, REG_T9); /* native signed byte load */
         else
-            EMIT_LBU(REG_V0, 0, REG_T1);
+            EMIT_LBU(REG_V0, 0, REG_T9);
     }
 
     /* Fast path falls through — store result immediately */
@@ -638,11 +639,6 @@ void emit_memory_read(int size, int rt_psx, int rs_psx, int16_t offset, int is_s
         e->rt_psx = rt_psx;
     }
     reg_cache_invalidate();
-done:
-    if (dyn_was_active) {
-        dyn_slots_active = 1;
-        dyn_reload_slots();
-    }
 }
 
 void emit_memory_read_signed(int size, int rt_psx, int rs_psx, int16_t offset)
@@ -655,8 +651,6 @@ void emit_memory_read_signed(int size, int rt_psx, int rs_psx, int16_t offset)
 
 void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
 {
-    int dyn_was_active = dyn_slots_active;
-    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     uint32_t const_addr = 0;
     int is_const = 0;
@@ -673,14 +667,14 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
         /* Aligned RAM access? */
         if ((phys < PSX_RAM_SIZE) && (phys % size == 0))
         {
-            emit_load_psx_reg(REG_T2, rt_psx);
-            emit_load_imm32(REG_T1, (uint32_t)psx_ram + phys);
+            emit_load_psx_reg(REG_T9, rt_psx);
+            emit_load_imm32(REG_T8, (uint32_t)psx_ram + phys);
             if (size == 4)
-                EMIT_SW(REG_T2, 0, REG_T1);
+                EMIT_SW(REG_T9, 0, REG_T8);
             else if (size == 2)
-                EMIT_SH(REG_T2, 0, REG_T1);
+                EMIT_SH(REG_T9, 0, REG_T8);
             else
-                EMIT_SB(REG_T2, 0, REG_T1);
+                EMIT_SB(REG_T9, 0, REG_T8);
 
             /* SMC detection: inline check of jit_l1_ram[page] before calling
              * the full handler.  Most pages have no compiled blocks, so the
@@ -690,24 +684,25 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             {
                 uint32_t page = phys >> 12;
                 flush_dirty_consts();
-                emit_load_imm32(REG_T0, (uint32_t)&jit_l1_ram[page]);
-                EMIT_LW(REG_T0, 0, REG_T0);     /* t0 = jit_l1_ram[page] */
+                emit_load_imm32(REG_T8, (uint32_t)&jit_l1_ram[page]);
+                EMIT_LW(REG_T8, 0, REG_T8);     /* t8 = jit_l1_ram[page] */
                 uint32_t *beq_ptr = code_ptr;
-                EMIT_BEQ(REG_T0, REG_ZERO, 0);   /* skip if NULL (placeholder) */
+                EMIT_BEQ(REG_T8, REG_ZERO, 0);   /* skip if NULL (placeholder) */
                 EMIT_NOP();
 
                 /* Only reached when page has compiled blocks */
                 emit_load_imm32(REG_A0, phys);
                 EMIT_SW(REG_S2, CPU_CYCLES_LEFT, REG_S0);
-                emit_load_imm32(REG_T0, (uint32_t)jit_smc_handler);
+                emit_load_imm32(REG_T8, (uint32_t)jit_smc_handler);
                 EMIT_JAL_ABS((uint32_t)call_c_trampoline_lite_addr);
                 EMIT_NOP();
+                /* T0/T1/T2 preserved by lite trampoline save/restore */
 
                 /* Fixup BEQ target to skip the handler call */
                 int32_t skip = (int32_t)(code_ptr - beq_ptr - 2);
-                *beq_ptr = MK_I(4, REG_T0, REG_ZERO, skip & 0xFFFF);
+                *beq_ptr = MK_I(4, REG_T8, REG_ZERO, skip & 0xFFFF);
             }
-            goto done_w;
+            return;
         }
         /* Scratchpad access? */
         if (phys >= 0x1F800000 && phys < 0x1F800400)
@@ -715,15 +710,15 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             uint32_t sp_off = phys & 0x3FF;
             if (sp_off % size == 0)
             {
-                emit_load_psx_reg(REG_T2, rt_psx);
-                emit_load_imm32(REG_T1, (uint32_t)scratchpad_buf + sp_off);
+                emit_load_psx_reg(REG_T9, rt_psx);
+                emit_load_imm32(REG_T8, (uint32_t)scratchpad_buf + sp_off);
                 if (size == 4)
-                    EMIT_SW(REG_T2, 0, REG_T1);
+                    EMIT_SW(REG_T9, 0, REG_T8);
                 else if (size == 2)
-                    EMIT_SH(REG_T2, 0, REG_T1);
+                    EMIT_SH(REG_T9, 0, REG_T8);
                 else
-                    EMIT_SB(REG_T2, 0, REG_T1);
-                goto done_w;
+                    EMIT_SB(REG_T9, 0, REG_T8);
+                return;
             }
         }
 
@@ -738,19 +733,19 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
          */
         if (phys == 0x1F801070 && size == 4) /* I_STAT */
         {
-            int data_reg = emit_use_reg(rt_psx, REG_T2);
-            EMIT_LW(REG_T1, CPU_I_STAT, REG_S0);              /* t1 = cpu.i_stat */
-            emit(MK_R(0, REG_T1, data_reg, REG_T1, 0, 0x24)); /* and t1, t1, data */
-            EMIT_SW(REG_T1, CPU_I_STAT, REG_S0);              /* cpu.i_stat = t1 */
-            goto done_w;
+            int data_reg = emit_use_reg(rt_psx, REG_T9);
+            EMIT_LW(REG_T8, CPU_I_STAT, REG_S0);              /* t8 = cpu.i_stat */
+            emit(MK_R(0, REG_T8, data_reg, REG_T8, 0, 0x24)); /* and t8, t8, data */
+            EMIT_SW(REG_T8, CPU_I_STAT, REG_S0);              /* cpu.i_stat = t8 */
+            return;
         }
         if (phys == 0x1F801074 && size == 4) /* I_MASK */
         {
-            emit_load_psx_reg(REG_T2, rt_psx);
-            emit_load_imm32(REG_T1, 0xFFFF07FF);
-            emit(MK_R(0, REG_T2, REG_T1, REG_T2, 0, 0x24)); /* and t2, t2, t1 */
-            EMIT_SW(REG_T2, CPU_I_MASK, REG_S0);
-            goto done_w;
+            emit_load_psx_reg(REG_T9, rt_psx);
+            emit_load_imm32(REG_T8, 0xFFFF07FF);
+            emit(MK_R(0, REG_T9, REG_T8, REG_T9, 0, 0x24)); /* and t9, t9, t8 */
+            EMIT_SW(REG_T9, CPU_I_MASK, REG_S0);
+            return;
         }
 
         /*
@@ -765,19 +760,19 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             /* Flush lazy consts before conditional fast/slow split */
             flush_dirty_consts();
             /* Check sio_selected == 0 */
-            emit_load_imm32(REG_T1, (uint32_t)&sio_selected);
-            EMIT_LW(REG_T1, 0, REG_T1);
+            emit_load_imm32(REG_T8, (uint32_t)&sio_selected);
+            EMIT_LW(REG_T8, 0, REG_T8);
             uint32_t *sio_slow = code_ptr;
-            EMIT_BNE(REG_T1, REG_ZERO, 0); /* bne t1, zero, @slow_sio */
+            EMIT_BNE(REG_T8, REG_ZERO, 0); /* bne t8, zero, @slow_sio */
             EMIT_NOP();
 
             /* Fast path: !sio_selected → 2 stores, no C call */
-            emit_load_imm32(REG_T1, (uint32_t)&sio_data);
-            EMIT_ORI(REG_T2, REG_ZERO, 0xFF);
-            EMIT_SW(REG_T2, 0, REG_T1); /* sio_data = 0xFF */
-            emit_load_imm32(REG_T1, (uint32_t)&sio_tx_pending);
-            EMIT_ORI(REG_T2, REG_ZERO, 1);
-            EMIT_SW(REG_T2, 0, REG_T1); /* sio_tx_pending = 1 */
+            emit_load_imm32(REG_T8, (uint32_t)&sio_data);
+            EMIT_ORI(REG_T9, REG_ZERO, 0xFF);
+            EMIT_SW(REG_T9, 0, REG_T8); /* sio_data = 0xFF */
+            emit_load_imm32(REG_T8, (uint32_t)&sio_tx_pending);
+            EMIT_ORI(REG_T9, REG_ZERO, 1);
+            EMIT_SW(REG_T9, 0, REG_T8); /* sio_tx_pending = 1 */
             uint32_t *sio_fast_done = code_ptr;
             emit(MK_I(0x04, REG_ZERO, REG_ZERO, 0)); /* b @done */
             EMIT_NOP();
@@ -798,7 +793,7 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             /* @done: patch fast-path branch */
             int32_t doff = (int32_t)(code_ptr - sio_fast_done - 1);
             *sio_fast_done = (*sio_fast_done & 0xFFFF0000) | ((uint32_t)doff & 0xFFFF);
-            goto done_w;
+            return;
         }
 
         /*
@@ -815,14 +810,14 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
             }
             emit_flush_partial_cycles();
             emit_call_c_lite((uint32_t)SIO_Write);
-            goto done_w;
+            return;
         }
     }
 
-    /* Compute effective address into REG_T0, data into REG_T2 */
-    emit_load_psx_reg(REG_T0, rs_psx);
-    EMIT_ADDIU(REG_T0, REG_T0, offset);
-    emit_load_psx_reg(REG_T2, rt_psx); /* data value */
+    /* Compute effective address into REG_T8, data into REG_T9 */
+    emit_load_psx_reg(REG_T8, rs_psx);
+    EMIT_ADDIU(REG_T8, REG_T8, offset);
+    emit_load_psx_reg(REG_T9, rt_psx); /* data value */
 
     /* Flush lazy consts before conditional fast/slow split
      * to prevent compile-time dirty-flag leak across paths */
@@ -842,14 +837,14 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
     uint32_t *align_branch = NULL;
     if (size > 1)
     {
-        emit(MK_I(0x0C, REG_T0, REG_T1, size - 1)); /* andi  t1, t0, size-1 */
+        emit(MK_I(0x0C, REG_T8, REG_AT, size - 1)); /* andi  at, t8, size-1 */
         align_branch = code_ptr;
-        emit(MK_I(0x05, REG_T1, REG_ZERO, 0));              /* bne   t1, zero, @cold */
-        emit(MK_R(0, REG_T0, REG_S3, REG_T1, 0, 0x24));    /* [delay] and t1, t0, s3 (phys) */
+        emit(MK_I(0x05, REG_AT, REG_ZERO, 0));              /* bne   at, zero, @cold */
+        emit(MK_R(0, REG_T8, REG_S3, REG_AT, 0, 0x24));    /* [delay] and at, t8, s3 (phys) */
     }
     else
     {
-        emit(MK_R(0, REG_T0, REG_S3, REG_T1, 0, 0x24));    /* and  t1, t0, s3  (phys) */
+        emit(MK_R(0, REG_T8, REG_S3, REG_AT, 0, 0x24));    /* and  at, t8, s3  (phys) */
     }
 
     /* Range check: non-RAM goes to cold path (WriteWord).
@@ -858,19 +853,19 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
     uint32_t *range_branch = NULL;
     if (rs_psx != 29) /* $sp always in RAM — skip range check */
     {
-        emit(MK_R(0, 0, REG_T1, REG_A0, 21, 0x02)); /* srl  a0, t1, 21      */
+        emit(MK_R(0, 0, REG_AT, REG_A0, 21, 0x02)); /* srl  a0, at, 21      */
         range_branch = code_ptr;
         emit(MK_I(0x05, REG_A0, REG_ZERO, 0));       /* bne  a0, zero, @cold */
     }
     uint32_t *bp_addu_w = code_ptr;  /* record for TLB backpatch */
-    EMIT_ADDU(REG_T1, REG_T1, REG_S1);           /* [delay/inline] addu t1, t1, s1 */
+    EMIT_ADDU(REG_AT, REG_AT, REG_S1);           /* [delay/inline] addu at, at, s1 */
     uint32_t *bp_fault_w = code_ptr; /* record: the store that may TLB-miss */
     if (size == 4)
-        EMIT_SW(REG_T2, 0, REG_T1);
+        EMIT_SW(REG_T9, 0, REG_AT);
     else if (size == 2)
-        EMIT_SH(REG_T2, 0, REG_T1);
+        EMIT_SH(REG_T9, 0, REG_AT);
     else
-        EMIT_SB(REG_T2, 0, REG_T1);
+        EMIT_SB(REG_T9, 0, REG_AT);
 
     /* Fast path falls through — no b @done needed */
 
@@ -916,11 +911,6 @@ void emit_memory_write(int size, int rt_psx, int rs_psx, int16_t offset)
         e->rt_psx = 0;
     }
     reg_cache_invalidate();
-done_w:
-    if (dyn_was_active) {
-        dyn_slots_active = 1;
-        dyn_reload_slots();
-    }
 }
 
 /*
@@ -934,8 +924,6 @@ done_w:
  */
 void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int use_load_delay)
 {
-    int dyn_was_active = dyn_slots_active;
-    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
     /* Load current rt value (merge target) */
     if (use_load_delay)
@@ -944,27 +932,27 @@ void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int us
         emit_load_psx_reg(REG_V0, rt_psx);
 
     /* Compute effective address */
-    emit_load_psx_reg(REG_T0, rs_psx);
-    EMIT_ADDIU(REG_T0, REG_T0, offset);
+    emit_load_psx_reg(REG_T8, rs_psx);
+    EMIT_ADDIU(REG_T8, REG_T8, offset);
 
     /* Flush lazy consts before conditional fast/slow split */
     flush_dirty_consts();
 
     /* Direct address fast path: S3 = 0x1FFFFFFF, S1 = TLB base or psx_ram */
-    emit(MK_R(0, REG_T0, REG_S3, REG_T1, 0, 0x24));    /* and  t1, t0, s3 (phys) */
+    emit(MK_R(0, REG_T8, REG_S3, REG_T9, 0, 0x24));    /* and  t9, t8, s3 (phys) */
     uint32_t *range_branch = NULL;
     {
-        emit(MK_R(0, 0, REG_T1, REG_T2, 21, 0x02));    /* srl  t2, t1, 21 (range) */
+        emit(MK_R(0, 0, REG_T9, REG_AT, 21, 0x02));    /* srl  at, t9, 21 (range) */
         range_branch = code_ptr;
-        emit(MK_I(0x05, REG_T2, REG_ZERO, 0));          /* bne  t2, zero, @cold */
+        emit(MK_I(0x05, REG_AT, REG_ZERO, 0));          /* bne  at, zero, @cold */
     }
-    EMIT_ADDU(REG_T1, REG_T1, REG_S1);                  /* [delay/inline] addu t1, t1, s1 */
+    EMIT_ADDU(REG_T9, REG_T9, REG_S1);                  /* [delay/inline] addu t9, t9, s1 */
 
     /* Fast path: native lwl/lwr on host address */
     if (is_left)
-        EMIT_LWL(REG_V0, 0, REG_T1);
+        EMIT_LWL(REG_V0, 0, REG_T9);
     else
-        EMIT_LWR(REG_V0, 0, REG_T1);
+        EMIT_LWR(REG_V0, 0, REG_T9);
 
     /* Fast path falls through — store result immediately */
     if (!dynarec_load_defer)
@@ -992,10 +980,6 @@ void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int us
         e->rt_psx = rt_psx;
     }
     reg_cache_invalidate();
-    if (dyn_was_active) {
-        dyn_slots_active = 1;
-        dyn_reload_slots();
-    }
 }
 
 /*
@@ -1008,13 +992,11 @@ void emit_memory_lwx(int is_left, int rt_psx, int rs_psx, int16_t offset, int us
  */
 void emit_memory_swx(int is_left, int rt_psx, int rs_psx, int16_t offset)
 {
-    int dyn_was_active = dyn_slots_active;
-    if (dyn_was_active) dyn_slots_active = 0;
     reg_cache_invalidate();
-    /* Compute effective address into T0, data into T2 */
-    emit_load_psx_reg(REG_T0, rs_psx);
-    EMIT_ADDIU(REG_T0, REG_T0, offset);
-    emit_load_psx_reg(REG_T2, rt_psx);
+    /* Compute effective address into T8, data into T9 */
+    emit_load_psx_reg(REG_T8, rs_psx);
+    EMIT_ADDIU(REG_T8, REG_T8, offset);
+    emit_load_psx_reg(REG_T9, rt_psx);
 
     /* Flush lazy consts before conditional fast/slow split */
     flush_dirty_consts();
@@ -1028,20 +1010,20 @@ void emit_memory_swx(int is_left, int rt_psx, int rs_psx, int16_t offset)
     EMIT_NOP();
 
     /* Direct address fast path (S3 = 0x1FFFFFFF, S1 = TLB base or psx_ram) */
-    emit(MK_R(0, REG_T0, REG_S3, REG_T1, 0, 0x24));    /* and  t1, t0, s3 (phys) */
+    emit(MK_R(0, REG_T8, REG_S3, REG_AT, 0, 0x24));    /* and  at, t8, s3 (phys) */
     uint32_t *range_branch = NULL;
     {
-        emit(MK_R(0, 0, REG_T1, REG_A0, 21, 0x02));    /* srl  a0, t1, 21 (range) */
+        emit(MK_R(0, 0, REG_AT, REG_A0, 21, 0x02));    /* srl  a0, at, 21 (range) */
         range_branch = code_ptr;
         emit(MK_I(0x05, REG_A0, REG_ZERO, 0));          /* bne  a0, zero, @cold */
     }
-    EMIT_ADDU(REG_T1, REG_T1, REG_S1);                  /* [delay/inline] addu t1, t1, s1 */
+    EMIT_ADDU(REG_AT, REG_AT, REG_S1);                  /* [delay/inline] addu at, at, s1 */
 
     /* Fast path: native swl/swr on host address */
     if (is_left)
-        EMIT_SWL(REG_T2, 0, REG_T1);
+        EMIT_SWL(REG_T9, 0, REG_AT);
     else
-        EMIT_SWR(REG_T2, 0, REG_T1);
+        EMIT_SWR(REG_T9, 0, REG_AT);
 
     /* Fast path falls through — no b @done needed */
 
@@ -1064,8 +1046,4 @@ void emit_memory_swx(int is_left, int rt_psx, int rs_psx, int16_t offset)
         e->rt_psx = 0;
     }
     reg_cache_invalidate();
-    if (dyn_was_active) {
-        dyn_slots_active = 1;
-        dyn_reload_slots();
-    }
 }

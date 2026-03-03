@@ -278,13 +278,13 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             EMIT_BEQ(REG_T9, REG_ZERO, 7); /* skip 7 insns to @divz */
             EMIT_NOP();
             /* Common path: native signed divide */
-            emit(MK_R(0, REG_T8, REG_T9, 0, 0, 0x1A)); /* div t0, t1 */
-            emit(MK_R(0, 0, 0, REG_T2, 0, 0x12));      /* mflo t2 */
-            emit(MK_R(0, 0, 0, REG_T8, 0, 0x10));      /* mfhi t0 */
-            EMIT_SW(REG_T2, CPU_LO, REG_S0);
+            emit(MK_R(0, REG_T8, REG_T9, 0, 0, 0x1A)); /* div t8, t9 */
+            emit(MK_R(0, 0, 0, REG_T8, 0, 0x12));      /* mflo t8 */
+            emit(MK_R(0, 0, 0, REG_T9, 0, 0x10));      /* mfhi t9 */
+            EMIT_SW(REG_T8, CPU_LO, REG_S0);
             uint32_t *b_end_div = code_ptr;
             emit(MK_I(4, REG_ZERO, REG_ZERO, 0)); /* beq zero,zero,@end (placeholder) */
-            EMIT_SW(REG_T8, CPU_HI, REG_S0);      /* delay slot */
+            EMIT_SW(REG_T9, CPU_HI, REG_S0);      /* delay slot */
             /* @divz: lo = (rs >= 0) ? -1 : 1, hi = rs */
             EMIT_SW(REG_T8, CPU_HI, REG_S0);                  /* hi = rs (T0 still has rs) */
             emit(MK_R(0, 0, REG_T8, REG_T9, 31, 0x03));       /* sra t1, t0, 31 */
@@ -307,13 +307,13 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             EMIT_BEQ(REG_T9, REG_ZERO, 7); /* skip 7 insns to @divz */
             EMIT_NOP();
             /* Common path: native unsigned divide */
-            emit(MK_R(0, REG_T8, REG_T9, 0, 0, 0x1B)); /* divu t0, t1 */
-            emit(MK_R(0, 0, 0, REG_T2, 0, 0x12));      /* mflo t2 */
-            emit(MK_R(0, 0, 0, REG_T8, 0, 0x10));      /* mfhi t0 */
-            EMIT_SW(REG_T2, CPU_LO, REG_S0);
+            emit(MK_R(0, REG_T8, REG_T9, 0, 0, 0x1B)); /* divu t8, t9 */
+            emit(MK_R(0, 0, 0, REG_T8, 0, 0x12));      /* mflo t8 */
+            emit(MK_R(0, 0, 0, REG_T9, 0, 0x10));      /* mfhi t9 */
+            EMIT_SW(REG_T8, CPU_LO, REG_S0);
             uint32_t *b_end_divu = code_ptr;
             emit(MK_I(4, REG_ZERO, REG_ZERO, 0)); /* beq zero,zero,@end (placeholder) */
-            EMIT_SW(REG_T8, CPU_HI, REG_S0);      /* delay slot */
+            EMIT_SW(REG_T9, CPU_HI, REG_S0);      /* delay slot */
             /* @divz: lo = 0xFFFFFFFF, hi = rs */
             EMIT_SW(REG_T8, CPU_HI, REG_S0);  /* hi = rs (T0 still has rs) */
             EMIT_ADDIU(REG_T8, REG_ZERO, -1); /* t0 = 0xFFFFFFFF */
@@ -353,8 +353,8 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             if (rd != 0 && psx_pinned_reg[rd])
                 EMIT_SW(psx_pinned_reg[rd], CPU_REG(rd), REG_S0);
 
-            /* Pre-compute rs^rt; save rs via stack to avoid T2 conflict
-             * when rd=0 (emit_dst_reg returns REG_T2 as junk dest). */
+            /* Pre-compute rs^rt; save rs via stack to avoid scratch conflict
+             * when rd=0 (emit_dst_reg returns REG_T8 as junk dest). */
             emit(MK_R(0, s1, s2, REG_AT, 0, 0x26)); /* XOR  AT, s1, s2  (rs^rt) */
             EMIT_SW(s1, 76, REG_SP);                /* save rs to stack */
 
@@ -362,9 +362,9 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             EMIT_ADDU(d, s1, s2); /* d = rs + rt */
 
             /* Overflow: ~(rs^rt) & (result^rs), bit31=1 => overflow.
-             * Load saved rs into T2 (or T0 when d=T2 to avoid self-XOR).
+             * Load saved rs into scratch (T8 or T9, avoiding d).
              * LW scheduled before NOR to hide load-use delay on R5900. */
-            int sr = (d == REG_T2) ? REG_T8 : REG_T2;
+            int sr = (d == REG_T8) ? REG_T9 : REG_T8;
             EMIT_LW(sr, 76, REG_SP);                          /* sr = saved rs */
             emit(MK_R(0, REG_AT, REG_ZERO, REG_AT, 0, 0x27)); /* NOR  AT, AT, $0 */
             emit(MK_R(0, d, sr, sr, 0, 0x26));                /* XOR  sr, d, sr  (result^rs) */
@@ -452,7 +452,7 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             emit(MK_R(0, s1, s2, d, 0, 0x23)); /* SUBU d, s1, s2 */
 
             /* Overflow: (rs^rt) & (result^rs), bit31=1 => overflow */
-            int sr = (d == REG_T2) ? REG_T8 : REG_T2;
+            int sr = (d == REG_T8) ? REG_T9 : REG_T8;
             EMIT_LW(sr, 76, REG_SP);                    /* sr = saved rs */
             EMIT_NOP();                                 /* load delay */
             emit(MK_R(0, d, sr, sr, 0, 0x26));          /* XOR  sr, d, sr */
@@ -636,7 +636,7 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
         EMIT_ADDU(d, s1, REG_T9); /* d = rs + imm */
 
         /* Overflow: ~(rs^imm) & (result^rs), bit31=1 => overflow */
-        int sr = (d == REG_T2) ? REG_T8 : REG_T2;
+        int sr = (d == REG_T8) ? REG_T9 : REG_T8;
         EMIT_LW(sr, 76, REG_SP);                          /* sr = saved rs */
         emit(MK_R(0, REG_AT, REG_ZERO, REG_AT, 0, 0x27)); /* NOR  AT, AT, $0 */
         emit(MK_R(0, d, sr, sr, 0, 0x26));                /* XOR  sr, d, sr */
@@ -1255,8 +1255,7 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
         emit_load_imm32(REG_A1, rt);
         emit_call_c((uint32_t)GTE_ReadData);
 
-        /* Memory write via LUT fast path (data in V0 → T2, addr in T0) */
-        EMIT_MOVE(REG_T2, REG_V0); /* T2 = GTE data */
+        /* Memory write via fast path (data stays in V0, addr in T8) */
         emit_load_psx_reg(REG_T8, rs);
         EMIT_ADDIU(REG_T8, REG_T8, imm); /* T0 = effective addr */
 
@@ -1284,7 +1283,7 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
         EMIT_ADDU(REG_T9, REG_T9, REG_S1); /* [delay/inline] host = base + phys */
 
         /* Fast path: direct store */
-        EMIT_SW(REG_T2, 0, REG_T9);
+        EMIT_SW(REG_V0, 0, REG_T9);
 
         uint32_t *done_swc2 = code_ptr;
         emit(MK_I(0x04, REG_ZERO, REG_ZERO, 0)); /* b @done */
@@ -1310,7 +1309,7 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             emit_load_imm32(REG_T9, (uint32_t)scratchpad_buf);
             emit(MK_I(0x0C, REG_T8, REG_A0, 0x3FF)); /* andi a0, t0, 0x3FF  */
             EMIT_ADDU(REG_T9, REG_T9, REG_A0);
-            EMIT_SW(REG_T2, 0, REG_T9);
+            EMIT_SW(REG_V0, 0, REG_T9);
             sp_done_swc2 = code_ptr;
             emit(MK_I(0x04, REG_ZERO, REG_ZERO, 0)); /* b @done             */
             EMIT_NOP();
@@ -1329,7 +1328,7 @@ int emit_instruction(uint32_t opcode, uint32_t psx_pc, int *mult_count)
             }
         }
         EMIT_MOVE(REG_A0, REG_T8);
-        EMIT_MOVE(REG_A1, REG_T2);
+        EMIT_MOVE(REG_A1, REG_V0);
         /* Flush partial cycle offset for accurate timer reads in WriteHardware */
         {
             uint32_t pbc_addr = (uint32_t)&partial_block_cycles;

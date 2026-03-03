@@ -57,16 +57,16 @@ void reg_cache_invalidate(void)
  *  that commandeer T0/T1/T2 for their own purposes.  After suspension,
  *  a reload restores the slot registers from the always-current memory.
  * ================================================================ */
-static const int dyn_slot_ee[DYN_SLOT_COUNT] = { REG_T0, REG_T1 };
-int dyn_slot_psx[DYN_SLOT_COUNT] = { -1, -1 };
+static const int dyn_slot_ee[DYN_SLOT_COUNT] = { REG_T0, REG_T1, REG_T2 };
+int dyn_slot_psx[DYN_SLOT_COUNT] = { -1, -1, -1 };
 int dyn_slots_active = 0;
-static int dyn_slots_saved_active = 0;
 
 /* Find the slot index holding PSX reg r, or -1 */
 static inline int dyn_slot_find(int r)
 {
     if (dyn_slot_psx[0] == r) return 0;
     if (dyn_slot_psx[1] == r) return 1;
+    if (dyn_slot_psx[2] == r) return 2;
     return -1;
 }
 
@@ -75,7 +75,7 @@ static inline int dyn_slot_find(int r)
  * the highest access count (minimum 2 accesses to justify a slot). */
 void dyn_assign_slots(BlockScanResult *scan)
 {
-    dyn_slot_psx[0] = dyn_slot_psx[1] = -1;
+    dyn_slot_psx[0] = dyn_slot_psx[1] = dyn_slot_psx[2] = -1;
     dyn_slots_active = 0;
 
     int slot = 0;
@@ -121,20 +121,8 @@ void dyn_reload_slots(void)
 
 void dyn_reset_slots(void)
 {
-    dyn_slot_psx[0] = dyn_slot_psx[1] = -1;
+    dyn_slot_psx[0] = dyn_slot_psx[1] = dyn_slot_psx[2] = -1;
     dyn_slots_active = 0;
-    dyn_slots_saved_active = 0;
-}
-
-void dyn_suspend_slots(void)
-{
-    dyn_slots_saved_active = dyn_slots_active;
-    dyn_slots_active = 0;
-}
-
-void dyn_resume_slots(void)
-{
-    dyn_slots_active = dyn_slots_saved_active;
 }
 
 /* Load PSX register 'r' from cpu struct into hw reg 'hwreg' */
@@ -152,7 +140,17 @@ void emit_load_psx_reg(int hwreg, int r)
         if (psx_pinned_reg[r] && hwreg != psx_pinned_reg[r])
             EMIT_MOVE(psx_pinned_reg[r], hwreg);
         else if (!psx_pinned_reg[r])
+        {
             EMIT_SW(hwreg, CPU_REG(r), REG_S0);
+            /* Also update dynamic slot EE register if r is cached in one.
+             * Without this, T0/T1/T2 desync from cpu.regs[] when a lazy
+             * const is materialized into a different register (e.g. T8). */
+            if (dyn_slots_active) {
+                int si = dyn_slot_find(r);
+                if (si >= 0 && dyn_slot_ee[si] != hwreg)
+                    EMIT_MOVE(dyn_slot_ee[si], hwreg);
+            }
+        }
         vregs[r].is_dirty = 0;
         dirty_const_mask &= ~(1u << r);
     }
@@ -232,7 +230,7 @@ int emit_use_reg(int r, int scratch)
 int emit_dst_reg(int r, int scratch)
 {
     if (r == 0)
-        return REG_T2; /* Junk register if writing to $0 (T2 is scratch, not a dyn slot) */
+        return REG_T8; /* Junk register if writing to $0 (T8 is scratch, not a dyn slot) */
     if (psx_pinned_reg[r])
         return psx_pinned_reg[r];
     if (dyn_slots_active) {
@@ -415,10 +413,12 @@ void emit_call_c(uint32_t func_addr)
     EMIT_SW(REG_S2, CPU_CYCLES_LEFT, REG_S0);
 
     /* Use the shared trampoline to flush/reload pinned registers and provide ABI shadow space
-     * without emitting 24 instructions per C-call. Target is passed in REG_T0. */
-    emit_load_imm32(REG_T0, func_addr);
+     * without emitting 24 instructions per C-call. Target is passed in REG_T8. */
+    emit_load_imm32(REG_T8, func_addr);
     EMIT_JAL_ABS((uint32_t)call_c_trampoline_addr);
     EMIT_NOP();
+    /* C helpers via call_c may write cpu.regs[] — reload dynamic slots
+     * from cpu.regs[] to pick up any changes (T0/T1/T2 are clobbered). */
     dyn_reload_slots();
     reg_cache_invalidate();
 }
@@ -431,10 +431,10 @@ void emit_call_c_lite(uint32_t func_addr)
      * Only flushes/reloads caller-saved pinned regs (T3-T7 = 5 regs), skipping
      * callee-saved pins (S4/S5/S6/S7/FP) which C ABI preserves. */
     EMIT_SW(REG_S2, CPU_CYCLES_LEFT, REG_S0);
-    emit_load_imm32(REG_T0, func_addr);
+    emit_load_imm32(REG_T8, func_addr);
     EMIT_JAL_ABS((uint32_t)call_c_trampoline_lite_addr);
     EMIT_NOP();
-    dyn_reload_slots();
+    /* T0/T1/T2 preserved by lite trampoline save/restore */
     reg_cache_invalidate();
 }
 

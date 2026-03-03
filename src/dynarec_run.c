@@ -253,6 +253,10 @@ void Init_Dynarec(void)
     call_c_trampoline_addr = &code_buffer[32];
     {
         uint32_t *p = call_c_trampoline_addr;
+        /* NOTE: T0/T1/T2 (dynamic slots) are NOT saved here because
+         * C helpers called via this trampoline may write to cpu.regs[],
+         * and the inline dyn_reload_slots() must pick up those changes.
+         * Only the lite trampoline saves/restores T0/T1/T2. */
         /* Flush ALL 10 pinned regs to cpu struct (exception safety) */
         *p++ = MK_I(0x2B, REG_S0, REG_T3, CPU_REG(2));   /* PSX $v0 */
         *p++ = MK_I(0x2B, REG_S0, REG_T4, CPU_REG(3));   /* PSX $v1 */
@@ -264,10 +268,10 @@ void Init_Dynarec(void)
         *p++ = MK_I(0x2B, REG_S0, REG_FP, CPU_REG(28));  /* PSX $gp */
         *p++ = MK_I(0x2B, REG_S0, REG_S4, CPU_REG(29));  /* PSX $sp */
         *p++ = MK_I(0x2B, REG_S0, REG_S5, CPU_REG(31));  /* PSX $ra */
-        /* Call target function */
+        /* Call target function (T8 = func_addr) */
         *p++ = MK_I(0x09, REG_SP, REG_SP, (uint32_t)(int32_t)-32);
         *p++ = MK_I(0x2B, REG_SP, REG_RA, 28);
-        *p++ = MK_R(0, REG_T0, 0, REG_RA, 0, 0x09); /* jalr t0 */
+        *p++ = MK_R(0, REG_T8, 0, REG_RA, 0, 0x09); /* jalr t8 */
         *p++ = 0;
         *p++ = MK_I(0x23, REG_SP, REG_RA, 28);
         *p++ = MK_I(0x09, REG_SP, REG_SP, 32);
@@ -292,20 +296,25 @@ void Init_Dynarec(void)
      * LWL/LWR, SWL/SWR).  Only saves/restores the caller-saved
      * pinned registers (T3-T7 = 5 regs), skipping the 5
      * callee-saved S-regs (S4, S5, S6, S7, FP) which the C ABI
-     * preserves automatically.  Saves 16 instructions per call. */
+     * preserves automatically.  Saves 16 instructions per call.
+     * Also preserves dynamic slot registers T0/T1/T2 on the stack. */
     call_c_trampoline_lite_addr = &code_buffer[68];
     {
         uint32_t *p = call_c_trampoline_lite_addr;
+        /* Save dynamic slot registers (T0/T1/T2) to stack frame offsets 0-8 */
+        *p++ = MK_I(0x2B, REG_SP, REG_T0, 0);            /* sw t0, 0(sp) */
+        *p++ = MK_I(0x2B, REG_SP, REG_T1, 4);            /* sw t1, 4(sp) */
+        *p++ = MK_I(0x2B, REG_SP, REG_T2, 8);            /* sw t2, 8(sp) */
         /* Flush only caller-saved pinned regs to cpu struct */
         *p++ = MK_I(0x2B, REG_S0, REG_T3, CPU_REG(2));   /* PSX $v0 */
         *p++ = MK_I(0x2B, REG_S0, REG_T4, CPU_REG(3));   /* PSX $v1 */
         *p++ = MK_I(0x2B, REG_S0, REG_T5, CPU_REG(4));   /* PSX $a0 */
         *p++ = MK_I(0x2B, REG_S0, REG_T6, CPU_REG(5));   /* PSX $a1 */
         *p++ = MK_I(0x2B, REG_S0, REG_T7, CPU_REG(6));   /* PSX $a2 */
-        /* Call target function */
+        /* Call target function (T8 = func_addr) */
         *p++ = MK_I(0x09, REG_SP, REG_SP, (uint32_t)(int32_t)-32);
         *p++ = MK_I(0x2B, REG_SP, REG_RA, 28);
-        *p++ = MK_R(0, REG_T0, 0, REG_RA, 0, 0x09); /* jalr t0 */
+        *p++ = MK_R(0, REG_T8, 0, REG_RA, 0, 0x09); /* jalr t8 */
         *p++ = 0;
         *p++ = MK_I(0x23, REG_SP, REG_RA, 28);
         *p++ = MK_I(0x09, REG_SP, REG_SP, 32);
@@ -315,6 +324,10 @@ void Init_Dynarec(void)
         *p++ = MK_I(0x23, REG_S0, REG_T5, CPU_REG(4));   /* PSX $a0 */
         *p++ = MK_I(0x23, REG_S0, REG_T6, CPU_REG(5));   /* PSX $a1 */
         *p++ = MK_I(0x23, REG_S0, REG_T7, CPU_REG(6));   /* PSX $a2 */
+        /* Restore dynamic slot registers */
+        *p++ = MK_I(0x23, REG_SP, REG_T0, 0);            /* lw t0, 0(sp) */
+        *p++ = MK_I(0x23, REG_SP, REG_T1, 4);            /* lw t1, 4(sp) */
+        *p++ = MK_I(0x23, REG_SP, REG_T2, 8);            /* lw t2, 8(sp) */
         *p++ = MK_R(0, REG_RA, 0, 0, 0, 0x08);
         *p++ = 0;
     }
@@ -325,10 +338,11 @@ void Init_Dynarec(void)
      * block if found.  Reduces dispatch overhead from ~50 to ~14 instr.
      *
      * Entry conditions (set by JR/JALR emission code):
-     *   T0 = target PSX PC (already stored in cpu.pc)
+     *   T8 = target PSX PC (already stored in cpu.pc)
      *   S2 = cycles_left (already decremented by block_cycle_count)
      *   S0 = &cpu (pinned)
      *
+     * Scratch: T9 (hash/row ptr), AT (comparisons/native ptr)
      * Exit: jump to target native block, or fall through to abort.
      */
     jump_dispatch_trampoline_addr = &code_buffer[96];
@@ -347,40 +361,35 @@ void Init_Dynarec(void)
         int32_t cyc_off = (int32_t)(cyc_ok - cyc_branch - 1);
         *cyc_branch = (*cyc_branch & 0xFFFF0000) | ((uint32_t)cyc_off & 0xFFFF);
 
-        /* 2. Compute hash: t1 = ((t0 >> 12) ^ t0) & JIT_HT_MASK */
-        *p++ = MK_R(0, 0, REG_T0, REG_T1, 12, 0x02);     /* srl  t1, t0, 12 */
-        *p++ = MK_R(0, REG_T1, REG_T0, REG_T1, 0, 0x26); /* xor  t1, t1, t0 */
-        *p++ = MK_I(0x0C, REG_T1, REG_T1, JIT_HT_MASK);  /* andi t1, t1, MASK */
+        /* 2. Compute hash: t9 = ((t8 >> 12) ^ t8) & JIT_HT_MASK */
+        *p++ = MK_R(0, 0, REG_T8, REG_T9, 12, 0x02);     /* srl  t9, t8, 12 */
+        *p++ = MK_R(0, REG_T9, REG_T8, REG_T9, 0, 0x26); /* xor  t9, t9, t8 */
+        *p++ = MK_I(0x0C, REG_T9, REG_T9, JIT_HT_MASK);  /* andi t9, t9, MASK */
 
-        /* 3. Scale to byte offset: t1 <<= 4 (sizeof(JitHTEntry) = 16, 2-way) */
-        *p++ = MK_R(0, 0, REG_T1, REG_T1, 4, 0x00); /* sll  t1, t1, 4 */
+        /* 3. Scale to byte offset: t9 <<= 4 (sizeof(JitHTEntry) = 16, 2-way) */
+        *p++ = MK_R(0, 0, REG_T9, REG_T9, 4, 0x00); /* sll  t9, t9, 4 */
 
-        /* 4. Load hash table base: t2 = &jit_ht */
+        /* 4. Load hash table base: at = &jit_ht */
         uint32_t ht_addr = (uint32_t)&jit_ht[0];
-        *p++ = MK_I(0x0F, 0, REG_T2, (ht_addr >> 16) & 0xFFFF); /* lui t2, hi */
-        *p++ = MK_I(0x0D, REG_T2, REG_T2, ht_addr & 0xFFFF);    /* ori t2, lo */
+        *p++ = MK_I(0x0F, 0, REG_AT, (ht_addr >> 16) & 0xFFFF); /* lui at, hi */
+        *p++ = MK_I(0x0D, REG_AT, REG_AT, ht_addr & 0xFFFF);    /* ori at, at, lo */
 
-        /* 5. Index into table: t1 = &jit_ht[hash] */
-        *p++ = MK_R(0, REG_T1, REG_T2, REG_T1, 0, 0x21); /* addu t1, t1, t2 */
+        /* 5. Index into table: t9 = &jit_ht[hash] */
+        *p++ = MK_R(0, REG_T9, REG_AT, REG_T9, 0, 0x21); /* addu t9, t9, at */
 
-        /* 6. Check slot 0: t2 = psx_pc[0], at = native[0]
-         *    Struct layout: { psx_pc[0]=+0, psx_pc[1]=+4, native[0]=+8, native[1]=+12 }
-         *    NOTE: use AT ($1) for native ptr — T3 ($11) is pinned to PSX $a0. */
-        *p++ = MK_I(0x23, REG_T1, REG_T2, 0);  /* lw t2, 0(t1) = psx_pc[0] */
-        *p++ = MK_I(0x23, REG_T1, REG_AT, 8);  /* lw at, 8(t1) = native[0] */
-
-        /* 7. If slot 0 matches, jump to @hit */
-        *p++ = MK_I(0x04, REG_T2, REG_T0, 0);  /* beq t2, t0, @hit (patched) */
+        /* 6. Check slot 0: at = psx_pc[0], compare with t8 */
+        *p++ = MK_I(0x23, REG_T9, REG_AT, 0);  /* lw at, 0(t9) = psx_pc[0] */
+        *p++ = MK_I(0x04, REG_AT, REG_T8, 0);  /* beq at, t8, @hit (patched) */
         uint32_t *hit0_branch = p - 1;
-        *p++ = 0;                                /* delay: nop */
+        *p++ = MK_I(0x23, REG_T9, REG_AT, 8);  /* (delay) lw at, 8(t9) = native[0] */
 
-        /* 8. Slot 0 miss — check slot 1 */
-        *p++ = MK_I(0x23, REG_T1, REG_T2, 4);  /* lw t2, 4(t1) = psx_pc[1] */
-        *p++ = MK_I(0x05, REG_T2, REG_T0, 0);  /* bne t2, t0, @miss (patched) */
+        /* 7. Slot 0 miss — check slot 1 */
+        *p++ = MK_I(0x23, REG_T9, REG_AT, 4);  /* lw at, 4(t9) = psx_pc[1] */
+        *p++ = MK_I(0x05, REG_AT, REG_T8, 0);  /* bne at, t8, @miss (patched) */
         uint32_t *miss_branch = p - 1;
-        *p++ = MK_I(0x23, REG_T1, REG_AT, 12); /* (delay) lw at, 12(t1) = native[1] */
+        *p++ = MK_I(0x23, REG_T9, REG_AT, 12); /* (delay) lw at, 12(t9) = native[1] */
 
-        /* 9. @hit: jump to native block — at has native[0] or native[1] */
+        /* 8. @hit: jump to native block — at has native[0] or native[1] */
         uint32_t *hit_target = p;
         int32_t hit0_off = (int32_t)(hit_target - hit0_branch - 1);
         *hit0_branch = (*hit0_branch & 0xFFFF0000) | ((uint32_t)hit0_off & 0xFFFF);
@@ -388,7 +397,7 @@ void Init_Dynarec(void)
         *p++ = MK_R(0, REG_AT, 0, 0, 0, 0x08); /* jr at */
         *p++ = 0;                                /* delay: nop */
 
-        /* 10. @miss: fall through to abort trampoline */
+        /* 9. @miss: fall through to abort trampoline */
         uint32_t *miss_target = p;
         int32_t miss_off = (int32_t)(miss_target - miss_branch - 1);
         *miss_branch = (*miss_branch & 0xFFFF0000) | ((uint32_t)miss_off & 0xFFFF);
@@ -399,9 +408,9 @@ void Init_Dynarec(void)
     /* ---- Memory slow-path trampoline at code_buffer[128] ----
      * Shared by all non-const memory reads/writes.
      * Entry: A0 = addr (reads) or A0 = addr, A1 = data (writes)
-     *        T0 = C function pointer (ReadWord/WriteHalf/etc.)
-     *        T2 = psx_pc (to store in cpu.current_pc)
-     *        T1 = cycle offset (for partial_block_cycles)
+     *        T8 = C function pointer (JALR'd by lite trampoline)
+     *        AT = psx_pc (to store in cpu.current_pc)
+     *        T9 = cycle offset (for partial_block_cycles)
      * Saves block RA, stores psx_pc, flushes partial cycles,
      * saves cycles_left, calls lite trampoline, returns to block. */
     mem_slow_trampoline_addr = &code_buffer[128];
@@ -412,9 +421,9 @@ void Init_Dynarec(void)
         uint16_t pbc_hi = (pbc_addr + 0x8000) >> 16;
 
         *p++ = MK_I(0x2B, REG_SP, REG_RA, 64);                      /* sw ra, 64(sp) */
-        *p++ = MK_I(0x2B, REG_S0, REG_T2, CPU_CURRENT_PC);          /* sw t2, cpu.current_pc */
-        *p++ = MK_I(0x0F, 0, REG_AT, pbc_hi);                       /* lui at, hi(&pbc) */
-        *p++ = MK_I(0x2B, REG_AT, REG_T1, (int16_t)pbc_lo);         /* sw t1, lo(&pbc) */
+        *p++ = MK_I(0x2B, REG_S0, REG_AT, CPU_CURRENT_PC);          /* sw at, cpu.current_pc */
+        *p++ = MK_I(0x0F, 0, REG_AT, pbc_hi);                       /* lui at, hi(&pbc) -- AT reused as scratch */
+        *p++ = MK_I(0x2B, REG_AT, REG_T9, (int16_t)pbc_lo);         /* sw t9, lo(&pbc) */
         *p++ = MK_I(0x2B, REG_S0, REG_S2, CPU_CYCLES_LEFT);         /* sw s2, cpu.cycles_left */
         *p++ = MK_J(3, (uint32_t)call_c_trampoline_lite_addr >> 2); /* jal lite_tramp */
         *p++ = 0;                                                   /* delay: nop */
@@ -427,6 +436,7 @@ void Init_Dynarec(void)
 
     printf("  Code buffer at %p (%u KB)\n", code_buffer, CODE_BUFFER_SIZE / 1024);
     printf("  Page Table (L1) initialized: %u + %u entries\n", JIT_L1_RAM_PAGES, JIT_L1_BIOS_PAGES);
+
     FlushCache(0);
     FlushCache(2);
 }

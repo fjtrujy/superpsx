@@ -29,7 +29,7 @@
 #define PATCH_SITE_MAX 8192
 
 #define SCAN_MAX_INSNS 64 /* Max instructions analyzed per block scan */
-#define DYN_SLOT_COUNT 2   /* Dynamic register slots: T0, T1 (T2 reserved for scratch) */
+#define DYN_SLOT_COUNT 3   /* Dynamic register slots: T0, T1, T2 (exclusive — not used as scratch) */
 
 /* ================================================================
  *  Shared types
@@ -375,15 +375,14 @@ void reg_cache_invalidate(void);
  * Per-block allocation: top-N non-pinned regs mapped to T0/T1/T2.
  * Write-through: every store updates both slot reg AND cpu.regs[],
  * so memory is always consistent — no writeback needed on exits.
- * Slots suspended during memory ops and C calls that clobber T0/T1/T2. */
+ * T0/T1/T2 are EXCLUSIVE slots — never used as inline scratch.
+ * Scratch registers: T8, T9, AT. */
 extern int dyn_slot_psx[DYN_SLOT_COUNT];
 extern int dyn_slots_active;
 void dyn_assign_slots(BlockScanResult *scan);
 void dyn_load_slots(void);
 void dyn_reload_slots(void);
 void dyn_reset_slots(void);
-void dyn_suspend_slots(void);
-void dyn_resume_slots(void);
 
 /* Compile-loop helpers: use AT instead of T8/T9 for non-GPR temporaries */
 void emit_cpu_field_to_psx_reg(int field_offset, int r);
