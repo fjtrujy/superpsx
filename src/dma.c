@@ -213,7 +213,20 @@ void DMA_Write(uint32_t addr, uint32_t data) {
   if (phys == 0x1F8010F4) {
     uint32_t rw_mask = 0x00FF803F;
     uint32_t ack_bits = data & 0x7F000000;
+    uint32_t old_master = dma_dicr & 0x80000000;
     dma_dicr = (data & rw_mask) | ((dma_dicr & 0x7F000000) & ~ack_bits);
+    /* Recalculate bit31 (Master IRQ Flag) — per psx-spx, this is
+     * read-only and reflects: Force_IRQ OR (Master_Enable AND
+     * (Enable AND Flags) != 0). Must recalculate after every write. */
+    uint32_t force = (dma_dicr >> 15) & 1;
+    uint32_t master_en = (dma_dicr >> 23) & 1;
+    uint32_t en = (dma_dicr >> 16) & 0x7F;
+    uint32_t flg = (dma_dicr >> 24) & 0x7F;
+    if (force || (master_en && (en & flg)))
+      dma_dicr |= 0x80000000;
+    /* Rising edge on bit31 → fire DMA master interrupt */
+    if (!old_master && (dma_dicr & 0x80000000))
+      SignalInterrupt(3);
     return;
   }
 }
