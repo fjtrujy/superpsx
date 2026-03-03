@@ -596,10 +596,8 @@ static void Upload_CLUT_CSM1(int cbp, int clut_x, int clut_y, int tex_format)
             {
                 uint16_t c0 = raw_clut[csm1_order_256[base + j * 2]];
                 uint16_t c1 = raw_clut[csm1_order_256[base + j * 2 + 1]];
-                if (c0 != 0)
-                    c0 |= 0x8000;
-                if (c1 != 0)
-                    c1 |= 0x8000;
+                c0 |= (-(c0 != 0)) & 0x8000;
+                c1 |= (-(c1 != 0)) & 0x8000;
                 uint32_t pair = (uint32_t)c0 | ((uint32_t)c1 << 16);
                 if (j < 2)
                     lo |= (uint64_t)pair << (j * 32);
@@ -620,10 +618,8 @@ static void Upload_CLUT_CSM1(int cbp, int clut_x, int clut_y, int tex_format)
             {
                 uint16_t c0 = raw_clut[base + j * 2];
                 uint16_t c1 = (base + j * 2 + 1 < 16) ? raw_clut[base + j * 2 + 1] : 0;
-                if (c0 != 0)
-                    c0 |= 0x8000;
-                if (c1 != 0)
-                    c1 |= 0x8000;
+                c0 |= (-(c0 != 0)) & 0x8000;
+                c1 |= (-(c1 != 0)) & 0x8000;
                 uint32_t pair = (uint32_t)c0 | ((uint32_t)c1 << 16);
                 if (j < 2)
                     lo |= (uint64_t)pair << (j * 32);
@@ -932,8 +928,7 @@ int Decode_TexWindow_Rect(int tex_format,
                 uint16_t packed = tex_row[tex_page_x + (u_win >> 2)];
                 int idx = (packed >> ((u_win & 3) * 4)) & 0xF;
                 uint16_t pixel = clut_ptr[idx];
-                if (pixel != 0)
-                    pixel |= 0x8000;
+                pixel |= (-(pixel != 0)) & 0x8000;
                 dst[col] = pixel;
             }
         }
@@ -955,8 +950,7 @@ int Decode_TexWindow_Rect(int tex_format,
                 uint16_t packed = tex_row[tex_page_x + (u_win >> 1)];
                 int idx = (packed >> ((u_win & 1) * 8)) & 0xFF;
                 uint16_t pixel = clut_ptr[idx];
-                if (pixel != 0)
-                    pixel |= 0x8000;
+                pixel |= (-(pixel != 0)) & 0x8000;
                 dst[col] = pixel;
             }
         }
@@ -976,8 +970,7 @@ int Decode_TexWindow_Rect(int tex_format,
                 uint32_t u_win = (u_iter & m_x) | o_x;
 
                 uint16_t pixel = tex_row[u_win];
-                if (pixel != 0)
-                    pixel |= 0x8000;
+                pixel |= (-(pixel != 0)) & 0x8000;
                 dst[col] = pixel;
             }
         }

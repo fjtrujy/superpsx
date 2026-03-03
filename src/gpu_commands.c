@@ -139,11 +139,9 @@ void GPU_WriteGP0(uint32_t data)
         {
             uint16_t gs_p0 = (uint16_t)(data & 0xFFFF);
             uint16_t gs_p1 = (uint16_t)(data >> 16);
-            // Only 0x0000 is transparent; 0x8000 (black + STP=1) is opaque
-            if (gs_p0 != 0)
-                gs_p0 |= 0x8000;
-            if (gs_p1 != 0)
-                gs_p1 |= 0x8000;
+            /* Branchless STP: bit 15 = opaque for non-zero pixels */
+            gs_p0 |= (-(gs_p0 != 0)) & 0x8000;
+            gs_p1 |= (-(gs_p1 != 0)) & 0x8000;
             pending_words[pending_count++] = (uint32_t)gs_p0 | ((uint32_t)gs_p1 << 16);
         }
 
