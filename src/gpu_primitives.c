@@ -444,7 +444,7 @@ int Translate_GP0_to_GS(uint32_t *psx_cmd)
                 int emit_tex0 = (is_textured && (!gs_state.valid || gs_state.tex0 != want_tex0 || need_texflush));
                 int emit_test = (is_textured && (!gs_state.valid || gs_state.test != want_test));
                 int emit_clamp = (is_textured && poly_hw_clut && (!gs_state.valid || gs_state.clamp != want_clamp));
-                int state_qws = emit_dthe + emit_alpha + emit_tex0 * 2 + emit_test + emit_clamp;
+                int state_qws = emit_dthe + emit_alpha + emit_tex0 + (emit_tex0 && need_texflush) + emit_test + emit_clamp;
 
                 for (int t = 0; t < 2; t++)
                 {
@@ -464,7 +464,8 @@ int Translate_GP0_to_GS(uint32_t *psx_cmd)
                         if (emit_tex0)
                         {
                             Push_GIF_Data(want_tex0, GS_REG_TEX0);
-                            Push_GIF_Data(0, GS_REG_TEXFLUSH);
+                            if (need_texflush)
+                                Push_GIF_Data(0, GS_REG_TEXFLUSH);
                         }
                         if (emit_test)
                             Push_GIF_Data(want_test, GS_REG_TEST_1);
@@ -637,7 +638,7 @@ int Translate_GP0_to_GS(uint32_t *psx_cmd)
             int e_clamp = (is_textured && tri_hw_clut && (!gs_state.valid || gs_state.clamp != tw_clamp));
 
             int ndata = is_textured ? 10 : 7;
-            ndata += e_dthe + e_alpha + e_tex0 * 2 + e_test + e_clamp;
+            ndata += e_dthe + e_alpha + e_tex0 + (e_tex0 && tw_texflush) + e_test + e_clamp;
             Push_GIF_Tag(GIF_TAG_LO(ndata, 1, 0, 0, 0, 1), GIF_REG_AD);
 
             if (e_dthe)
@@ -649,7 +650,8 @@ int Translate_GP0_to_GS(uint32_t *psx_cmd)
             if (e_tex0)
             {
                 Push_GIF_Data(tw_tex0, GS_REG_TEX0);
-                Push_GIF_Data(0, GS_REG_TEXFLUSH);
+                if (tw_texflush)
+                    Push_GIF_Data(0, GS_REG_TEXFLUSH);
             }
             if (e_test)
                 Push_GIF_Data(tw_test, GS_REG_TEST_1);
@@ -1057,7 +1059,7 @@ int Translate_GP0_to_GS(uint32_t *psx_cmd)
                                    (!gs_state.valid || gs_state.tex0 != want_tex0_r || need_texflush_r));
                 int emit_test_r = (!gs_state.valid || gs_state.test != want_test_r);
                 int emit_clamp_r = (rect_hw_clut && (!gs_state.valid || gs_state.clamp != want_clamp_r));
-                int state_qws_r = emit_dthe_r + emit_alpha_r + emit_tex0_r * 2 + emit_test_r + emit_clamp_r;
+                int state_qws_r = emit_dthe_r + emit_alpha_r + emit_tex0_r + (emit_tex0_r && need_texflush_r) + emit_test_r + emit_clamp_r;
 
                 int nregs = 1 + 6 + state_qws_r; /* PRIM + 2×(UV+RGBAQ+XYZ) + state */
 
@@ -1072,7 +1074,8 @@ int Translate_GP0_to_GS(uint32_t *psx_cmd)
                 if (emit_tex0_r)
                 {
                     Push_GIF_Data(want_tex0_r, GS_REG_TEX0);
-                    Push_GIF_Data(0, GS_REG_TEXFLUSH);
+                    if (need_texflush_r)
+                        Push_GIF_Data(0, GS_REG_TEXFLUSH);
                 }
                 if (emit_test_r)
                     Push_GIF_Data(want_test_r, GS_REG_TEST_1);

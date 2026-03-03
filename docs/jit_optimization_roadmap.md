@@ -5,7 +5,7 @@
 | # | Optimización | Estado | Detalles |
 |---|---|---|---|
 | 1 | Register Pinning | ✅ 10 GPR + 4 infra | v0,v1,a0-a2→T3-T7 · s0,s1→S6,S7 · gp→FP · sp→S4 · ra→S5. Infra: S0=cpu, S1=RAM, S2=cycles, S3=mask |
-| 2 | Dynamic Slots (T0/T1/T2) | ✅ 3 slots | Frecuencia-based `dyn_assign_slots()`. Write-through exclusivo. Lazy const desync fix en `emit_load_psx_reg` |
+| 2 | Dynamic Slots (T0/T1/T2) | ✅ 3 slots | Frecuencia-based `dyn_assign_slots()`. Partial dirty tracking: `emit_cpu_field_to_psx_reg`/`emit_materialize_psx_imm`/`flush_dirty_consts` deferred; `emit_store_psx_reg`/`emit_sync_reg` write-through (required for game correctness) |
 | 3 | Constant Propagation | ✅ | `vregs[32]` con `dirty_const_mask`, lazy materialization |
 | 4 | Dead Code Elimination | ✅ | Backward liveness en `block_scan()`, ventana 64 insn (`dce_dead_mask`) |
 | 5 | Direct Block Linking | ✅ | J-based DBL con back-patching + SMC check (page_gen + hash) |
@@ -93,7 +93,7 @@ Full regalloc al estilo pcsx_rearmed: `regmap[HOST_REGS]` per-instruction con di
 
 | Issue | Descripción | Impacto |
 |---|---|---|
-| Prologue 29 words | 116 bytes overhead. Super-blocks mitigan (3 continuations = 1 prologue). | Bajo |
+| Prologue 26 words | 104 bytes overhead. Super-blocks mitigan (3 continuations = 1 prologue). | Bajo |
 | Branch cond en stack | Trade-off por pin $gp. +1 SW/LW por conditional branch. | Aceptable |
 | memset en buffer reset | `compile_block` hace memset de hasta 4MB. Innecesario. | Bajo |
 | DCE ventana 64 insn | `uint64_t` bitmask. Expandible a 128 con `__uint128_t`. | Bajo |

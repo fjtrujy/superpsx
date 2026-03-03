@@ -41,7 +41,8 @@ void GPU_DMA2(uint32_t madr, uint32_t bcr, uint32_t chcr)
     uint32_t direction = chcr & 1;
 
     // Flush any pending GIF data from direct GP0 writes before starting DMA
-    Flush_GIF();
+    if (fast_gif_ptr != (gif_qword_t *)&gif_packet_buf[current_buffer][0])
+        Flush_GIF();
 
     // Sync Mode 0 (Continuous) and 1 (Block/Request): CPU -> GPU transfer
     if (sync_mode == 0 || sync_mode == 1)
@@ -281,7 +282,8 @@ void GPU_DMA2(uint32_t madr, uint32_t bcr, uint32_t chcr)
             addr = next & 0x1FFFFC;
         }
 
-        Flush_GIF();
+        if (fast_gif_ptr != (gif_qword_t *)&gif_packet_buf[current_buffer][0])
+            Flush_GIF();
 
         /* ── DMA bus + GPU processing cycle cost for linked-list ── */
         {

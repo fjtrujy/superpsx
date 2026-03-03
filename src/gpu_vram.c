@@ -240,22 +240,20 @@ void GS_UploadRegionFast(uint32_t coords, uint32_t dims, uint32_t *data_ptr, uin
     // 1. Update shadow VRAM (optional, but good for CLUT textures since they might be used immediately)
     if (psx_vram_shadow)
     {
+        int px = x, py = y;
         for (uint32_t i = 0; i < word_count; i++)
         {
             uint32_t data = data_ptr[i];
-            uint32_t n = i * 2;
 
-            // Pixel 0 of the word
-            int px0 = x + (n % w);
-            int py0 = y + (n / w);
-            if (px0 < 1024 && py0 < 512)
-                psx_vram_shadow[py0 * 1024 + px0] = data & 0xFFFF;
+            /* Pixel 0 */
+            if (px < 1024 && py < 512)
+                psx_vram_shadow[py * 1024 + px] = data & 0xFFFF;
+            if (++px >= x + w) { px = x; py++; }
 
-            // Pixel 1 of the word
-            int px1 = x + ((n + 1) % w);
-            int py1 = y + ((n + 1) / w);
-            if (px1 < 1024 && py1 < 512)
-                psx_vram_shadow[py1 * 1024 + px1] = data >> 16;
+            /* Pixel 1 */
+            if (px < 1024 && py < 512)
+                psx_vram_shadow[py * 1024 + px] = data >> 16;
+            if (++px >= x + w) { px = x; py++; }
         }
     }
 

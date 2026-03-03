@@ -21,21 +21,29 @@ cmake --build build 2>&1 | tail -5
 
 # GTE test (expect: 1150 passed, 0 failed)
 rm -f build/superpsx.ini && printf "gte_vu0 = 0\n" > build/superpsx.ini && \
-perl -e 'alarm 60; exec @ARGV' make -C build run GAMEARGS=tests/gte/test-all/test-all.exe 2>&1 | \
-grep -E "Passed|Failed" | head -5; \
-rm -f build/superpsx.ini && ln -s $(pwd)/superpsx.ini build/superpsx.ini
+perl -e 'alarm 60; exec @ARGV' make -C build run \
+  GAMEARGS=tests/gte/test-all/test-all.exe > /tmp/gte_out.txt 2>&1; \
+grep -E "Passed|Failed" /tmp/gte_out.txt | head -5; \
+rm -f build/superpsx.ini && ln -sf $(pwd)/superpsx.ini build/superpsx.ini
 
-# CPU test (expect: 0, Result end in 101)
-perl -e 'alarm 120; exec @ARGV' make -C build run GAMEARGS=tests/psxtest_cpu/psxtest_cpu.exe 2>&1 | grep -c "error"
+# CPU test (expect: 0 errors)
+perl -e 'alarm 120; exec @ARGV' make -C build run \
+  GAMEARGS=tests/psxtest_cpu/psxtest_cpu.exe > /tmp/cpu_out.txt 2>&1; \
+grep -c "error" /tmp/cpu_out.txt
 
 # Timer test
-perl -e 'alarm 60; exec @ARGV' make -C build run GAMEARGS=tests/timers/timers.exe 2>&1 | tail -20
+perl -e 'alarm 60; exec @ARGV' make -C build run \
+  GAMEARGS=tests/timers/timers.exe > /tmp/timer_out.txt 2>&1; \
+tail -5 /tmp/timer_out.txt
 
-# Crash Bandicoot
+# Crash Bandicoot (manual test — ask user)
 make -C build run GAMEARGS=isos/CrashBandicoot/CrashBandicoot.cue
 ```
 
-**IMPORTANT:** macOS has no `timeout`/`gtimeout`. Use `perl -e 'alarm N; exec @ARGV'` for timeouts.
+**IMPORTANT:**
+- macOS has no `timeout`/`gtimeout`. Use `perl -e 'alarm N; exec @ARGV'` for timeouts.
+- **Always redirect to file** (`> /tmp/out.txt 2>&1`), NEVER pipe (`|`). Pipes cause SIGPIPE to kill the emulator prematurely.
+- For GPU/rendering changes, do NOT run automated tests — ask the user to launch Crash Bandicoot and MK2 manually and report results.
 
 ## Testing Protocol
 
@@ -43,8 +51,9 @@ Before committing ANY change to the dynarec or emulation core:
 
 1. Build must succeed with zero warnings (except known ones in tlb_handler.c when TLB disabled)
 2. GTE: 1150 passed, 0 failed
-3. CPU: 227 (known deviation count — must not change)
+3. CPU: 0 errors (grep -c "error")
 4. Timer test: must complete without hangs
+5. **For GPU/rendering changes:** ask the user to test Crash Bandicoot and MK2 manually
 
 ## Code Conventions
 
@@ -56,13 +65,17 @@ Before committing ANY change to the dynarec or emulation core:
 
 ## JIT Register Allocation
 
-13 PSX registers are permanently pinned to EE hardware registers:
+10 PSX registers are permanently pinned to EE hardware registers:
 
-- v0→S6, v1→V1, a0-a3→T3-T6, t0-t2→T7-T9, gp→FP, sp→S4, s8→S7, ra→S5
+- Caller-saved: v0→T3, v1→T4, a0→T5, a1→T6, a2→T7
+- Callee-saved: s0→S6, s1→S7, gp→FP, sp→S4, ra→S5
 - Infrastructure: S0=cpu ptr, S1=RAM/TLB base, S2=cycles, S3=mask(0x1FFFFFFF)
-- Scratch: T0, T1, T2, AT (T0/T1 have a scratch cache for non-pinned regs)
+- Dynamic slots: T0, T1, T2 (frequency-based per-block assignment, partial dirty tracking)
+- Scratch: T8, T9 (with scratch cache for non-pinned regs), AT
 
 The other 19 PSX GPRs go through `LW/SW` to `cpu.regs[]` (offset from S0).
+
+Dynamic slots use partial dirty tracking: `emit_cpu_field_to_psx_reg`, `emit_materialize_psx_imm`, and `flush_dirty_consts` defer writes to cpu.regs[]. `emit_store_psx_reg` and `emit_sync_reg` use write-through (required for game correctness — root cause TBD).
 
 ## Code Buffer Layout
 
@@ -70,7 +83,7 @@ Trampolines at fixed offsets in `code_buffer[]`:
 
 - [0]: slow-path, [2]: abort, [32]: full C-call, [68]: lite C-call, [96]: jump dispatch, [128]: mem slow-path
 - JIT blocks start at [144+]
-- `DYNAREC_PROLOGUE_WORDS = 29` (skip in direct block links)
+- `DYNAREC_PROLOGUE_WORDS = 26` (skip in direct block links)
 
 ## Current Roadmap
 
